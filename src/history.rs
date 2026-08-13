@@ -66,6 +66,59 @@ fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+/// A session is considered still "running" if its most recent evidence of
+/// activity (an `llm_usage` row, a `tool_span` row, or — with nothing else —
+/// its own `started_at`) falls within this window of "now". Sessions whose
+/// `end_reason` is NULL (never received a `SessionEnd` — backfilled history
+/// predating hook install, or the daemon was down when the session ended)
+/// but whose last activity is older than this are "inactive" rather than
+/// "running", regardless of how old `started_at` is.
+const RUNNING_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// Derive a display status + duration for a session whose `end_reason`
+/// and/or `ended_at` may be NULL. `last_activity_ms` is `MAX(started_at,
+/// last tool_span activity, last llm_usage activity)` — never a bare `now`,
+/// so a session that never got a `SessionEnd` doesn't read as perpetually
+/// "running".
+///
+/// - `ended_at` present -> status = `end_reason` if set, else "ended";
+///   duration = ended_at - started_at. This wins regardless of whether
+///   `end_reason` was captured, since `ended_at` alone is the authoritative
+///   "this session is over" signal (`end_session` always sets it on
+///   SessionEnd; `end_reason` capture is a separate, less reliable path).
+/// - `ended_at` NULL and recently active (within `RUNNING_GRACE_MS` of
+///   `now`) -> "running", duration = now - started_at.
+/// - `ended_at` NULL and stale -> "inactive", duration = last_activity_ms
+///   - started_at (never start -> now).
+fn derive_status(
+    end_reason: Option<&str>,
+    ended_at: Option<i64>,
+    started_at: i64,
+    last_activity_ms: i64,
+    now: i64,
+) -> (String, i64) {
+    // A session's `ended_at` is the authoritative signal that it's over —
+    // it's set (by `end_session`) whenever a SessionEnd hook lands,
+    // independent of whether `end_reason` was captured. Sessions that
+    // received SessionEnd before the h_end "reason"-field fix have
+    // `ended_at` set with `end_reason` NULL; treating those as
+    // running/inactive (keyed only on `end_reason`) discards a real end
+    // timestamp in favor of guessing from activity. So `ended_at` presence
+    // always wins, with "ended" as the status when no reason was recorded.
+    if let Some(ended) = ended_at {
+        let duration_s = (ended - started_at) / 1000;
+        return (end_reason.unwrap_or("ended").to_string(), duration_s.max(0));
+    }
+    if now - last_activity_ms <= RUNNING_GRACE_MS {
+        ("running".to_string(), ((now - started_at) / 1000).max(0))
+    } else {
+        (
+            "inactive".to_string(),
+            ((last_activity_ms - started_at) / 1000).max(0),
+        )
+    }
+}
+
 /// Build the full `/api/history` response.
 pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<Value> {
     let b = compute_bounds(store, days)?;
@@ -310,20 +363,27 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
     )?;
 
     // ---- sessions ----
-    let sessions = store.query_json(
+    // last_span_ts/last_llm_ts are computed in the same narrow-set-filtered
+    // GROUP BY joins as calls/cpu_s/tokens_out above — no extra full-table
+    // scan, just two more aggregate columns on the same grouped subqueries.
+    // status/duration_s are then derived per-row in Rust (`derive_status`)
+    // rather than in SQL, since the derivation is exactly what the unit
+    // tests below need to exercise directly.
+    let mut sessions = store.query_json(
         "SELECT s.id id, s.started_at started_at, s.ended_at ended_at, p.name project,
            s.git_branch branch, s.pr_number pr_number,
-           CAST((COALESCE(s.ended_at, ?4) - s.started_at)/1000 AS INTEGER) duration_s,
            COALESCE(ts.calls,0) calls, COALESCE(ts.cpu_s,0) cpu_s, COALESCE(ts.peak_mb,0) peak_mb,
            COALESCE(u.tokens_out,0) tokens_out, COALESCE(u.cost,0) cost, COALESCE(u.unpriced,0) unpriced,
            s.end_reason end_reason, COALESCE(ts.leaked,0) leaked, COALESCE(ts.failed,0) failed,
-           EXISTS(SELECT 1 FROM session_sample ss WHERE ss.session_id = s.id) has_samples
+           EXISTS(SELECT 1 FROM session_sample ss WHERE ss.session_id = s.id) has_samples,
+           MAX(s.started_at, COALESCE(ts.last_span_ts,0), COALESCE(u.last_llm_ts,0)) last_activity_ms
          FROM session s
          LEFT JOIN project p ON p.id = s.project_id
          LEFT JOIN (
            SELECT session_id, COUNT(*) calls, SUM(COALESCE(cpu_ns,cpu_ns_sampled))/1e9 cpu_s,
              MAX(peak_footprint)/1e6 peak_mb, SUM(leaked_count) leaked,
-             SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) failed
+             SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) failed,
+             MAX(COALESCE(ended_at,started_at)) last_span_ts
            FROM tool_span
            WHERE session_id IN (
              SELECT s2.id FROM session s2 LEFT JOIN project p2 ON p2.id = s2.project_id
@@ -334,7 +394,8 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
          ) ts ON ts.session_id = s.id
          LEFT JOIN (
            SELECT session_id, SUM(output_tokens) tokens_out, SUM(cost_usd) cost,
-             SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) unpriced
+             SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) unpriced,
+             MAX(ts) last_llm_ts
            FROM llm_usage
            WHERE session_id IN (
              SELECT s2.id FROM session s2 LEFT JOIN project p2 ON p2.id = s2.project_id
@@ -350,9 +411,20 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
             &proj as &dyn ToSql,
             &b.cur_start as &dyn ToSql,
             &b.cur_end as &dyn ToSql,
-            &now as &dyn ToSql,
         ],
     )?;
+    for row in sessions.iter_mut() {
+        let end_reason = row["end_reason"].as_str();
+        let ended_at = row.get("ended_at").and_then(|v| v.as_i64());
+        let started_at = i(row, "started_at");
+        let last_activity_ms = i(row, "last_activity_ms");
+        let (status, duration_s) =
+            derive_status(end_reason, ended_at, started_at, last_activity_ms, now);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("status".to_string(), json!(status));
+            obj.insert("duration_s".to_string(), json!(duration_s));
+        }
+    }
     let session_count = sessions.len();
     let span_count: i64 = sessions.iter().map(|s| i(s, "calls")).sum();
 
@@ -441,7 +513,9 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
            COALESCE(ts.calls,0) calls,
            COALESCE(u.tokens_in,0) tokens_in, COALESCE(u.tokens_out,0) tokens_out,
            COALESCE(u.cache,0) cache_read, COALESCE(u.cost,0) cost, COALESCE(u.unpriced,0) unpriced,
-           s.project_id project_id
+           s.project_id project_id,
+           COALESCE((SELECT MAX(COALESCE(ended_at,started_at)) FROM tool_span WHERE session_id = s.id),0) last_span_ts,
+           COALESCE((SELECT MAX(ts) FROM llm_usage WHERE session_id = s.id),0) last_llm_ts
          FROM session s
          LEFT JOIN project p ON p.id = s.project_id
          LEFT JOIN (SELECT session_id, COUNT(*) calls FROM tool_span GROUP BY session_id) ts
@@ -459,6 +533,17 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
         return Ok(None);
     };
     let project_id = facts.get("project_id").and_then(|v| v.as_i64());
+    let now = crate::store::now_ms();
+    let last_activity_ms = i(&facts, "started_at")
+        .max(i(&facts, "last_span_ts"))
+        .max(i(&facts, "last_llm_ts"));
+    let (status, _duration_s) = derive_status(
+        facts["end_reason"].as_str(),
+        facts.get("ended_at").and_then(|v| v.as_i64()),
+        i(&facts, "started_at"),
+        last_activity_ms,
+        now,
+    );
 
     // ---- samples ----
     let sample_rows = store.query_json(
@@ -577,6 +662,8 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
             "started_at": facts["started_at"],
             "ended_at": facts["ended_at"],
             "end_reason": facts["end_reason"],
+            "status": status,
+            "last_activity_ms": last_activity_ms,
             "calls": facts["calls"],
             "tokens_in": facts["tokens_in"],
             "tokens_out": facts["tokens_out"],
@@ -743,6 +830,159 @@ mod tests {
     fn build_session_unknown_id_returns_none() {
         let (dir, store) = scratch();
         assert!(build_session(&store, "nope").unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn derive_status_ended_session_unchanged() {
+        let (status, duration_s) =
+            derive_status(Some("clear"), Some(10_000), 1_000, 5_000, 999_999);
+        assert_eq!(status, "clear");
+        assert_eq!(duration_s, 9); // (10_000 - 1_000)/1000, independent of "now"
+    }
+
+    #[test]
+    fn derive_status_ended_at_set_with_null_end_reason_is_ended_not_running() {
+        // Sessions that received SessionEnd before the h_end "reason"-field
+        // fix landed have ended_at set but end_reason NULL. ended_at must
+        // still win over the running/inactive activity-based guess, using
+        // its real end timestamp for duration rather than last_activity_ms
+        // or `now`.
+        let started_at = 1_000_i64;
+        let ended_at = 61_000_i64;
+        let last_activity_ms = 50_000_i64; // would otherwise suggest "inactive"
+        let now = 10_000_000_i64; // would otherwise suggest neither running nor inactive is close
+        let (status, duration_s) =
+            derive_status(None, Some(ended_at), started_at, last_activity_ms, now);
+        assert_eq!(status, "ended");
+        assert_eq!(duration_s, (ended_at - started_at) / 1000);
+    }
+
+    #[test]
+    fn derive_status_recent_activity_is_running() {
+        let now = 1_000_000_i64;
+        let last_activity_ms = now - 60_000; // 1 minute ago, well within the 10-min grace window
+        let (status, duration_s) = derive_status(None, None, 900_000, last_activity_ms, now);
+        assert_eq!(status, "running");
+        // duration counts to `now`, not to last_activity_ms, while running.
+        assert_eq!(duration_s, (now - 900_000) / 1000);
+    }
+
+    #[test]
+    fn derive_status_stale_null_end_reason_is_inactive() {
+        // Simulates the bug report: a session from 17 Jul with end_reason
+        // NULL (backfilled history / daemon down at session end) should not
+        // read as "running" with a duration stretching to `now`.
+        let started_at = 0_i64;
+        let last_activity_ms = 3_600_000; // last evidence of activity: 1h in
+        let now = started_at + 655 * 3_600_000; // "655h duration" from the bug report
+        let (status, duration_s) = derive_status(None, None, started_at, last_activity_ms, now);
+        assert_eq!(status, "inactive");
+        // Duration is to last activity, not to `now` — sane instead of 655h.
+        assert_eq!(duration_s, last_activity_ms / 1000);
+        assert!(duration_s < 3600 * 2);
+    }
+
+    #[test]
+    fn derive_status_boundary_at_grace_window() {
+        let now = 1_000_000_i64;
+        // Exactly at the boundary: still running (uses <=).
+        let (status, _) = derive_status(None, None, 0, now - RUNNING_GRACE_MS, now);
+        assert_eq!(status, "running");
+        // One ms past the boundary: inactive.
+        let (status, _) = derive_status(None, None, 0, now - RUNNING_GRACE_MS - 1, now);
+        assert_eq!(status, "inactive");
+    }
+
+    #[test]
+    fn sessions_query_derives_inactive_for_stale_null_end_reason() {
+        let (dir, store) = scratch();
+        let pid = store.upsert_project("/tmp/proj-stale").unwrap();
+        let now = crate::store::now_ms();
+        let long_ago = now - 60 * 24 * 3_600_000; // 60 days ago
+        store
+            .upsert_session("stale1", Some(pid), None, None, None, long_ago)
+            .unwrap();
+        // A tool_span an hour after start, then nothing — end_reason never set.
+        store
+            .write_span(
+                &SpanRecord {
+                    session_id: "stale1".into(),
+                    tool_use_id: Some("t1".into()),
+                    agent_id: None,
+                    agent_type: None,
+                    tool_name: "Bash".into(),
+                    cmd_digest: Some("echo hi".into()),
+                    started_at: long_ago,
+                    ended_at: long_ago + 3_600_000,
+                    ok: Some(true),
+                    cpu_ns: Some(1_000_000_000),
+                    cpu_ns_sampled: 1_000_000_000,
+                    peak_footprint: 1 << 20,
+                    disk_read: 0,
+                    disk_write: 0,
+                    proc_count: 1,
+                    leaked_count: 0,
+                },
+                &[],
+            )
+            .unwrap();
+        // A recently-active session in the same project, to confirm it
+        // stays "running" (must query with enough `days` to cover both).
+        store
+            .upsert_session("active1", Some(pid), None, None, None, now - 60_000)
+            .unwrap();
+
+        let out = build_history(&store, 90, None).unwrap();
+        let sessions = out["sessions"].as_array().unwrap();
+        let stale = sessions.iter().find(|s| s["id"] == "stale1").unwrap();
+        assert_eq!(stale["status"], "inactive");
+        // Duration should be ~1h (to last activity), not ~60 days.
+        let dur = stale["duration_s"].as_i64().unwrap();
+        assert!(dur < 2 * 3600, "expected duration near 1h, got {dur}s");
+
+        let active = sessions.iter().find(|s| s["id"] == "active1").unwrap();
+        assert_eq!(active["status"], "running");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sessions_query_ended_session_status_is_end_reason() {
+        let (dir, store) = scratch();
+        let pid = store.upsert_project("/tmp/proj-ended").unwrap();
+        let now = crate::store::now_ms();
+        store
+            .upsert_session("ended1", Some(pid), None, None, None, now - 10_000)
+            .unwrap();
+        store
+            .end_session("ended1", now - 5_000, Some("clear"))
+            .unwrap();
+
+        let out = build_history(&store, 7, None).unwrap();
+        let sessions = out["sessions"].as_array().unwrap();
+        let s = sessions.iter().find(|s| s["id"] == "ended1").unwrap();
+        assert_eq!(s["status"], "clear");
+        assert_eq!(s["duration_s"], 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_session_facts_status_running_and_inactive() {
+        let (dir, store) = scratch();
+        let now = crate::store::now_ms();
+        store
+            .upsert_session("running-s", None, None, None, None, now - 30_000)
+            .unwrap();
+        let result = build_session(&store, "running-s").unwrap().unwrap();
+        assert_eq!(result["facts"]["status"], "running");
+
+        let long_ago = now - 60 * 24 * 3_600_000;
+        store
+            .upsert_session("inactive-s", None, None, None, None, long_ago)
+            .unwrap();
+        let result = build_session(&store, "inactive-s").unwrap().unwrap();
+        assert_eq!(result["facts"]["status"], "inactive");
+        assert_eq!(result["facts"]["last_activity_ms"], long_ago);
         std::fs::remove_dir_all(&dir).ok();
     }
 

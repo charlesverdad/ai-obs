@@ -533,7 +533,8 @@ async fn h_end(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value> 
     let Some(sid) = s(&v, "session_id") else {
         return Json(json!({}));
     };
-    let reason = s(&v, "why");
+    // Claude Code sends the end reason as `reason`; older builds used `why`.
+    let reason = s(&v, "reason").or_else(|| s(&v, "why"));
     {
         let mut corr = st.corr.lock().unwrap();
         corr.end_session(&st.store, &sid, reason.as_deref());

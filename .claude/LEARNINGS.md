@@ -131,3 +131,21 @@ and load-bearing — this is not a changelog.
   changes in settings.json applied to already-running sessions in practice
   (SubagentStart fired from a session started before install) — don't rely
   on it, but don't assume a restart is required either.
+
+- **`session.end_reason` is NULL far more often than the schema comment
+  implies**: on this machine's real production db (13,477 sessions), 100%
+  had `end_reason IS NULL` — not just backfilled pre-hook history, ordinary
+  recent sessions too (SessionEnd apparently isn't firing/landing reliably
+  in practice, separate from the known "daemon down at exit" case). Any
+  dashboard logic that treats NULL `end_reason` as "still running" will
+  mislabel nearly every session. The fix (`history.rs::derive_status`) is
+  evidence-based: a session is "running" only if `last_activity_ms` (max of
+  `started_at`, latest `tool_span` activity, latest `llm_usage` activity)
+  is within 10 minutes of now; otherwise "inactive", with duration measured
+  to `last_activity_ms`, never to `now`. Compute `last_activity_ms` via the
+  same narrow, already-`session_id`-filtered GROUP BY joins used for
+  calls/cost/etc — adding `MAX(...)` columns to an existing grouped
+  subquery is ~free; a naive per-session correlated subquery over
+  `llm_usage`/`tool_span` is not (see the dashboard-aggregate-queries note
+  above) once used inside the *list* query, though it's fine for the
+  single-row `/api/session/{id}` lookup.
