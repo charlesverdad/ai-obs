@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<!-- Reference mock from claude.ai/design project be4976a4-3b74-4cbd-8f0a-a5e2b3562633
+     ("ai-obs History.dc.html"). This is a design-time template (x-dc / sc-for /
+     sc-if are the design tool's constructs, {{ }} are bindings, the DCLogic class
+     generates FAKE seeded data). The real implementation replaces the fake data()
+     with fetches against the daemon's /api/history and /api/session/{id}, keeping
+     the layout, styling, and interaction model exactly as specified here. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  html, body { margin: 0; padding: 0; background: #08090a; }
+  * { box-sizing: border-box; }
+  a { color: #e8eaea; text-decoration: none; border-bottom: 1px solid #2a2f31; }
+  a:hover { color: #ffffff; border-bottom-color: #6c7376; }
+</style>
+</helmet>
+
+<div style="padding:56px;background:#08090a;font-family:'IBM Plex Sans',system-ui,sans-serif">
+<div style="width:1440px;margin:0 auto;background:#0b0c0d;border:1px solid #1b1f21;display:flex;flex-direction:column">
+
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 30px;border-bottom:1px solid #1b1f21">
+    <div style="display:flex;align-items:baseline;gap:16px">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:19px;font-weight:600;color:#f2f4f4">ai-obs</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#6c7376">report</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#5a6165">{{ rangeLabel }} · {{ sessionCount }} sessions · {{ spanCount }} tool calls</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:22px">
+      <div style="display:flex;border:1px solid #1b1f21">
+        <sc-for list="{{ ranges }}" as="r" hint-placeholder-count="3">
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;padding:6px 14px;cursor:pointer;border-right:1px solid #1b1f21;background: {{ r.bg }};color: {{ r.fg }}" onClick="{{ r.onPick }}">{{ r.label }}</div>
+        </sc-for>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#5a6165">~/.local/share/ai-obs/ai-obs.db · 34 MB · read-only</div>
+    </div>
+  </div>
+
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:28px;padding:11px 30px;border-bottom:1px solid #1b1f21;font-family:'IBM Plex Mono',monospace;font-size:12px">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="color:#5a6165;letter-spacing:.06em">PROJECT</span>
+      <div style="display:flex;gap:6px">
+        <sc-for list="{{ projectFilters }}" as="p" hint-placeholder-count="5">
+          <span style="padding:4px 10px;cursor:pointer;border:1px solid {{ p.rule }};color: {{ p.fg }};background: {{ p.bg }}" onClick="{{ p.onPick }}">{{ p.label }}</span>
+        </sc-for>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:26px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="color:#5a6165;letter-spacing:.06em">ONLY</span>
+        <sc-for list="{{ toggles }}" as="t" hint-placeholder-count="3">
+          <span style="cursor:pointer;white-space:nowrap;color: {{ t.fg }}" onClick="{{ t.onPick }}">{{ t.mark }} {{ t.label }}</span>
+        </sc-for>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="color:#5a6165;letter-spacing:.06em">SORT</span>
+        <sc-for list="{{ sorts }}" as="o" hint-placeholder-count="4">
+          <span style="cursor:pointer;padding-bottom:2px;border-bottom:1px solid {{ o.rule }};color: {{ o.fg }}" onClick="{{ o.onPick }}">{{ o.label }}</span>
+        </sc-for>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="color:#5a6165;white-space:nowrap">{{ filterSummary }}</span>
+        <span style="cursor:pointer;color: {{ resetColor }};border-bottom:1px solid #2a2f31" onClick="{{ onReset }}">reset</span>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid #1b1f21">
+    <div style="padding:22px 30px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:8px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#6c7376;font-weight:500">SPEND</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums"><span style="color:#5a6165;font-size:18px">$</span><span style="color:#f2f4f4">{{ kpiCost }}</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">{{ kpiCostDelta }} vs previous {{ rangeShort }}</div>
+    </div>
+    <div style="padding:22px 30px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:8px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#6c7376;font-weight:500">CPU</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums;white-space:nowrap"><span style="color:#f2f4f4">{{ kpiCoreHours }}</span><span style="color:#5a6165;font-size:18px"> core-h</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">{{ kpiCpuNote }}</div>
+    </div>
+    <div style="padding:22px 30px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:8px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#6c7376;font-weight:500">TOKENS</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums"><span style="color:#f2f4f4">{{ kpiTokens }}</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">{{ kpiCache }} read from cache</div>
+    </div>
+    <div style="padding:22px 30px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:8px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#6c7376;font-weight:500">LEAKED PROCS</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums"><span style="color:#f2f4f4">{{ kpiLeaked }}</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">across {{ kpiLeakedSpans }} tool calls</div>
+    </div>
+    <div style="padding:22px 30px;display:flex;flex-direction:column;gap:8px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#6c7376;font-weight:500">FINDINGS</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums;white-space:nowrap"><span style="color:#ff4d3d">{{ kpiCrit }}</span><span style="color:#5a6165;font-size:18px"> crit</span><span style="color:#8b9295;font-size:18px">  {{ kpiWarn }} warn</span></div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">{{ kpiFindingSessions }} sessions affected</div>
+    </div>
+  </div>
+
+  <div style="padding:22px 30px 26px;border-bottom:1px solid #1b1f21;display:flex;flex-direction:column;gap:18px">
+    <div style="display:flex;align-items:baseline;justify-content:space-between">
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">{{ metricTitle }}</div>
+      <div style="display:flex;gap:16px;font-family:'IBM Plex Mono',monospace;font-size:11px">
+        <sc-for list="{{ metrics }}" as="m" hint-placeholder-count="3">
+          <span style="cursor:pointer;padding-bottom:2px;border-bottom:1px solid {{ m.rule }};color: {{ m.fg }}" onClick="{{ m.onPick }}">{{ m.label }}</span>
+        </sc-for>
+      </div>
+    </div>
+    <div style="display:flex;align-items:flex-end;gap:3px;height:132px;border-bottom:1px solid #2a2f31;padding-bottom:0">
+      <sc-for list="{{ days }}" as="d" hint-placeholder-count="30">
+        <div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:132px" title="{{ d.title }}">
+          <div style="width:100%;background: {{ d.color }};height: {{ d.h }}"></div>
+        </div>
+      </sc-for>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#5a6165">
+      <span>{{ axisStart }}</span><span>{{ axisMid }}</span><span>{{ axisEnd }}</span>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1.15fr 1fr 1fr;border-bottom:1px solid #1b1f21">
+    <div style="padding:22px 30px 26px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:14px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">SPEND BY PROJECT</div>
+      <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;color:#5a6165">
+        <span style="flex:1">PROJECT</span>
+        <span style="width:44px;text-align:right">SESS</span>
+        <span style="width:56px;text-align:right">IN</span>
+        <span style="width:56px;text-align:right">OUT</span>
+        <span style="width:66px;text-align:right">COST</span>
+      </div>
+      <sc-for list="{{ byProject }}" as="p" hint-placeholder-count="4">
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums">
+            <span style="flex:1;color:#e8eaea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ p.project }}</span>
+            <span style="width:44px;text-align:right;color:#6c7376">{{ p.sessions }}</span>
+            <span style="width:56px;text-align:right;color:#8b9295">{{ p.in }}</span>
+            <span style="width:56px;text-align:right;color:#8b9295">{{ p.out }}</span>
+            <span style="width:66px;text-align:right;color:#f2f4f4">{{ p.cost }}</span>
+          </div>
+          <div style="height:3px;background:#15181a"><div style="height:3px;background:#c9cfd1;width: {{ p.w }}"></div></div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="padding:22px 30px 26px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:14px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">RESOURCES BY PROJECT</div>
+      <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;color:#5a6165">
+        <span style="flex:1">PROJECT</span>
+        <span style="width:46px;text-align:right">CALLS</span>
+        <span style="width:50px;text-align:right">CPU S</span>
+        <span style="width:56px;text-align:right">PEAK</span>
+        <span style="width:38px;text-align:right">LEAK</span>
+      </div>
+      <sc-for list="{{ byResource }}" as="p" hint-placeholder-count="4">
+        <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;padding:3px 0">
+          <span style="flex:1;color:#e8eaea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ p.project }}</span>
+          <span style="width:46px;text-align:right;color:#8b9295">{{ p.calls }}</span>
+          <span style="width:50px;text-align:right;color:#c9cfd1">{{ p.cpu }}</span>
+          <span style="width:56px;text-align:right;color:#8b9295">{{ p.peak }}</span>
+          <span style="width:38px;text-align:right;color: {{ p.leakColor }}">{{ p.leaked }}</span>
+        </div>
+      </sc-for>
+      <div style="height:1px;background:#1b1f21;margin:4px 0 2px"></div>
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500;padding-top:2px">HEAVIEST COMMANDS</div>
+      <sc-for list="{{ heaviest }}" as="h" hint-placeholder-count="5">
+        <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;padding:2px 0">
+          <span style="flex:1;color:#e8eaea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ h.cmd }}</span>
+          <span style="width:46px;text-align:right;color:#6c7376">{{ h.calls }}</span>
+          <span style="width:50px;text-align:right;color:#c9cfd1">{{ h.cpu }}</span>
+          <span style="width:56px;text-align:right;color:#8b9295">{{ h.peak }}</span>
+          <span style="width:38px;text-align:right;color: {{ h.leakColor }}">{{ h.leaked }}</span>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="padding:22px 30px 26px;display:flex;flex-direction:column;gap:14px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">TOKENS BY MODEL</div>
+      <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;color:#5a6165">
+        <span style="flex:1">MODEL</span>
+        <span style="width:46px;text-align:right">IN</span>
+        <span style="width:46px;text-align:right">OUT</span>
+        <span style="width:52px;text-align:right">CACHE</span>
+        <span style="width:56px;text-align:right">COST</span>
+      </div>
+      <sc-for list="{{ byModel }}" as="m" hint-placeholder-count="3">
+        <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;padding:3px 0">
+          <span style="flex:1;color:#e8eaea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ m.model }}</span>
+          <span style="width:46px;text-align:right;color:#8b9295">{{ m.in }}</span>
+          <span style="width:46px;text-align:right;color:#8b9295">{{ m.out }}</span>
+          <span style="width:52px;text-align:right;color:#6c7376">{{ m.cache }}</span>
+          <span style="width:56px;text-align:right;color:#f2f4f4">{{ m.cost }}</span>
+        </div>
+      </sc-for>
+      <div style="height:1px;background:#1b1f21;margin:4px 0 2px"></div>
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500;padding-top:2px">FINDINGS IN RANGE</div>
+      <sc-for list="{{ findings }}" as="f" hint-placeholder-count="4">
+        <div style="display:flex;gap:10px;font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:1.5;padding:2px 0">
+          <span style="width:74px;flex:none;color: {{ f.color }};white-space:nowrap">{{ f.kind }}</span>
+          <span style="flex:1;color:#8b9295">{{ f.message }}</span>
+          <span style="width:52px;flex:none;text-align:right;color:#4d5457">{{ f.when }}</span>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;border-bottom:1px solid #1b1f21">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;padding:22px 30px 14px">
+      <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">SESSIONS</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">newest first · click a row to replay it</div>
+    </div>
+    <div style="display:flex;padding:0 30px 8px;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;color:#5a6165">
+      <span style="width:124px">STARTED</span>
+      <span style="width:130px">PROJECT</span>
+      <span style="width:150px">BRANCH</span>
+      <span style="width:58px">PR</span>
+      <span style="width:74px;text-align:right">DURATION</span>
+      <span style="width:62px;text-align:right">CALLS</span>
+      <span style="width:70px;text-align:right">CPU S</span>
+      <span style="width:70px;text-align:right">PEAK</span>
+      <span style="width:64px;text-align:right">TOK OUT</span>
+      <span style="width:74px;text-align:right">COST</span>
+      <span style="flex:1;padding-left:24px">ENDED</span>
+    </div>
+    <sc-for list="{{ sessions }}" as="s" hint-placeholder-count="9">
+      <div style="display:flex;align-items:center;padding:10px 30px;border-top:1px solid #15181a;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums;cursor:pointer;background: {{ s.bg }}" onClick="{{ s.onSelect }}">
+        <span style="width:124px;display:flex;align-items:center;gap:9px"><span style="width:3px;height:12px;background: {{ s.mark }}"></span><span style="color:#8b9295">{{ s.started }}</span></span>
+        <span style="width:130px;color:#f2f4f4">{{ s.project }}</span>
+        <span style="width:150px;color:#8b9295">{{ s.branch }}</span>
+        <span style="width:58px;color:#6c7376">{{ s.pr }}</span>
+        <span style="width:74px;text-align:right;color:#8b9295">{{ s.duration }}</span>
+        <span style="width:62px;text-align:right;color:#8b9295">{{ s.calls }}</span>
+        <span style="width:70px;text-align:right;color:#c9cfd1">{{ s.cpu }}</span>
+        <span style="width:70px;text-align:right;color:#8b9295">{{ s.peak }}</span>
+        <span style="width:64px;text-align:right;color:#8b9295">{{ s.tout }}</span>
+        <span style="width:74px;text-align:right;color:#f2f4f4">{{ s.cost }}</span>
+        <span style="flex:1;padding-left:24px;display:flex;align-items:center;gap:10px;white-space:nowrap">
+          <span style="color:#6c7376">{{ s.endReason }}</span>
+          <span style="color: {{ s.flagColor }}">{{ s.flag }}</span>
+        </span>
+      </div>
+    </sc-for>
+    <sc-if value="{{ noSessions }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px 30px;border-top:1px solid #15181a;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#5a6165">no sessions match this filter</div>
+    </sc-if>
+  </div>
+
+  <sc-if value="{{ hasSessions }}" hint-placeholder-val="{{ true }}">
+  <div style="display:flex">
+    <div style="flex:1;padding:22px 30px 28px;border-right:1px solid #1b1f21;display:flex;flex-direction:column;gap:18px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between">
+        <div style="display:flex;align-items:baseline;gap:14px">
+          <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">SESSION REPLAY</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#f2f4f4">{{ selProject }}</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">{{ selWhen }} · {{ selDuration }}</div>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">session_sample at 1 Hz · {{ selWindow }} tool_span rows shown</div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#5a6165">
+          <span>CPU % (fill) · FOOTPRINT (line)</span>
+          <span>{{ selPeakCpu }} peak · {{ selPeakMem }} peak footprint</span>
+        </div>
+        <svg viewBox="0 0 900 190" preserveAspectRatio="none" style="width:100%;height:190px;display:block">
+          <line x1="0" y1="1" x2="900" y2="1" stroke="#1b1f21"></line>
+          <line x1="0" y1="95" x2="900" y2="95" stroke="#15181a"></line>
+          <line x1="0" y1="189" x2="900" y2="189" stroke="#2a2f31"></line>
+          <path d="{{ cpuArea }}" fill="#181c1e"></path>
+          <path d="{{ cpuLine }}" fill="none" stroke="#8b9295" stroke-width="1"></path>
+          <path d="{{ memLine }}" fill="none" stroke="#e8eaea" stroke-width="1.5"></path>
+          <path d="{{ critArea }}" fill="rgba(255,77,61,0.18)"></path>
+        </svg>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <sc-for list="{{ gantt }}" as="g" hint-placeholder-count="10">
+          <div style="display:flex;align-items:center;gap:12px;height:19px">
+            <span style="width:172px;flex:none;font-family:'IBM Plex Mono',monospace;font-size:11px;color: {{ g.labelColor }};overflow:hidden;white-space:nowrap;text-overflow:ellipsis">{{ g.label }}</span>
+            <span style="flex:1;position:relative;height:11px;background:#101314">
+              <span style="position:absolute;top:0;height:11px;left: {{ g.left }};width: {{ g.width }};background: {{ g.color }}"></span>
+            </span>
+            <span style="width:74px;flex:none;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8b9295;font-variant-numeric:tabular-nums">{{ g.cpu }}</span>
+            <span style="width:74px;flex:none;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#6c7376;font-variant-numeric:tabular-nums">{{ g.peak }}</span>
+            <span style="width:96px;flex:none;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;color: {{ g.noteColor }}">{{ g.note }}</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#5a6165;padding-left:184px">
+        <span>00:00</span><span>{{ tickA }}</span><span>{{ tickB }}</span><span>{{ tickC }}</span><span>{{ selDuration }}</span>
+      </div>
+    </div>
+
+    <div style="width:396px;padding:22px 30px 28px;display:flex;flex-direction:column;gap:20px">
+      <div style="display:flex;flex-direction:column;gap:9px">
+        <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">SESSION</div>
+        <sc-for list="{{ selFacts }}" as="f" hint-placeholder-count="7">
+          <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px">
+            <span style="width:112px;flex:none;color:#5a6165">{{ f.k }}</span>
+            <span style="flex:1;color: {{ f.color }};overflow:hidden;text-overflow:ellipsis">{{ f.v }}</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="height:1px;background:#1b1f21"></div>
+
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">PROCESS TREE — {{ treeSpan }}</div>
+        <sc-for list="{{ tree }}" as="p" hint-placeholder-count="6">
+          <div style="display:flex;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums">
+            <span style="flex:1;color: {{ p.color }};white-space:pre">{{ p.name }}</span>
+            <span style="width:58px;text-align:right;color:#8b9295">{{ p.cpu }}</span>
+            <span style="width:62px;text-align:right;color:#6c7376">{{ p.mem }}</span>
+          </div>
+        </sc-for>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165;line-height:1.6;padding-top:2px">{{ treeNote }}</div>
+      </div>
+
+      <div style="height:1px;background:#1b1f21"></div>
+
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:11px;letter-spacing:.1em;color:#8b9295;font-weight:500">THIS SESSION vs {{ selProject }} MEDIAN</div>
+        <sc-for list="{{ compare }}" as="c" hint-placeholder-count="4">
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <div style="display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:12px;font-variant-numeric:tabular-nums">
+              <span style="color:#8b9295">{{ c.label }}</span>
+              <span style="color:#f2f4f4">{{ c.value }}<span style="color: {{ c.deltaColor }}"> {{ c.delta }}</span></span>
+            </div>
+            <div style="height:3px;background:#15181a;position:relative">
+              <div style="height:3px;background: {{ c.barColor }};width: {{ c.w }}"></div>
+              <div style="position:absolute;top:-2px;width:1px;height:7px;background:#4d5457;left: {{ c.medianW }}"></div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 30px;border-top:1px solid #1b1f21;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5a6165">
+    <span>{{ cmdHint }}</span>
+    <span>read-only query · WAL · nothing leaves this machine</span>
+  </div>
+
+</div>
+</div>
+
+</x-dc>
+</body>
+</html>

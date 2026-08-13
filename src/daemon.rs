@@ -2,9 +2,12 @@
 
 use crate::correlator::{snapshot_map, Correlator, Session, Span};
 use crate::store::{now_ms, RecentSpanRow, Store, TokenTotals};
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,10 +57,19 @@ pub struct AppState {
     pub agent_totals_cache: AgentTokenTotalsCache,
     /// Cached last-10-per-session closed spans — feeds the collapsible tree.
     pub recent_spans_cache: RecentSpansCache,
+    /// Dedicated read-only connection for the historical dashboard
+    /// (`/api/history`, `/api/session/{id}`) — never the writer connection,
+    /// so a slow aggregate can't block the PreToolUse hot path. WAL makes
+    /// concurrent read safe.
+    pub dashboard_store: Arc<Store>,
+    pub db_path: std::path::PathBuf,
 }
 
 pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
     let store = Arc::new(Store::open(db_path)?);
+    // Opened after Store::open above so the schema (incl. the dashboard's
+    // idx_llm_ts / idx_span_started indexes) already exists.
+    let dashboard_store = Arc::new(Store::open_readonly(db_path)?);
     let corr = Arc::new(Mutex::new(Correlator::default()));
     let state = AppState {
         store: store.clone(),
@@ -67,6 +79,8 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         token_totals_cache: Arc::new(Mutex::new(None)),
         agent_totals_cache: Arc::new(Mutex::new(None)),
         recent_spans_cache: Arc::new(Mutex::new(None)),
+        dashboard_store,
+        db_path: db_path.to_path_buf(),
     };
 
     // Sampler loop (blocking-ish work on a dedicated thread-friendly task).
@@ -86,6 +100,7 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
     }
 
     let app = Router::new()
+        .route("/", get(dashboard_html))
         .route("/h/session-start", post(h_session_start))
         .route("/h/pre", post(h_pre))
         .route("/h/post", post(h_post))
@@ -93,6 +108,8 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         .route("/h/end", post(h_end))
         .route("/api/status", get(api_status))
         .route("/api/top", get(api_top))
+        .route("/api/history", get(api_history))
+        .route("/api/session/{id}", get(api_session))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", port());
@@ -637,4 +654,73 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
         )
         .collect::<Vec<_>>();
     Json(json!({ "sessions": sessions, "findings": findings }))
+}
+
+// ---------------- historical dashboard ----------------
+
+async fn dashboard_html() -> Html<&'static str> {
+    Html(include_str!("dashboard.html"))
+}
+
+#[derive(Deserialize)]
+struct HistoryParams {
+    days: Option<i64>,
+    project: Option<String>,
+}
+
+async fn api_history(
+    State(st): State<AppState>,
+    Query(params): Query<HistoryParams>,
+) -> axum::response::Response {
+    let days = crate::history::clamp_days(params.days);
+    let store = st.dashboard_store.clone();
+    let db_path = st.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::history::build_history(&store, days, params.project.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(mut v)) => {
+            let (path, size_mb) = db_info(&db_path);
+            v["db"] = json!({ "path": path, "size_mb": size_mb });
+            Json(v).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("api_history: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "history query failed").into_response()
+        }
+        Err(e) => {
+            tracing::warn!("api_history: join error {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "history query failed").into_response()
+        }
+    }
+}
+
+async fn api_session(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let store = st.dashboard_store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::history::build_session(&store, &id)).await;
+    match result {
+        Ok(Ok(Some(v))) => Json(v).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "session not found").into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!("api_session: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "session query failed").into_response()
+        }
+        Err(e) => {
+            tracing::warn!("api_session: join error {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "session query failed").into_response()
+        }
+    }
+}
+
+/// Real db path + on-disk size in MB, for the dashboard's header note.
+fn db_info(db_path: &std::path::Path) -> (String, f64) {
+    let size_mb = std::fs::metadata(db_path)
+        .map(|m| (m.len() as f64 / 1_000_000.0 * 10.0).round() / 10.0)
+        .unwrap_or(0.0);
+    (db_path.display().to_string(), size_mb)
 }

@@ -51,3 +51,20 @@ and load-bearing — this is not a changelog.
   code signature and launchd refuses to respawn it ("spawn scheduled" forever).
   Always `cp` to a temp name then `mv -f` (new inode), then
   `launchctl kickstart -k gui/$UID/dev.ai-obs.daemon`.
+
+- **Dashboard aggregate queries over `llm_usage` (history.rs)**: this table
+  is the dominant cost at real scale (300k+ rows on a live install vs. a few
+  hundred in `tool_span`/`session`). `date(ts/1000,'unixepoch','localtime')`
+  is *non-deterministic* to SQLite (depends on OS timezone) so it can't back
+  an index — `CREATE INDEX ... (date(...))` errors with "non-deterministic
+  use of date() in an index". The only lever is minimizing the *number* of
+  full-table scans: (1) never write one correlated subquery per output
+  metric/day — GROUP BY once and derive every number from that one result
+  set in Rust; a naive "one subquery per day" bar-chart query is O(days)
+  full scans and single-handedly blew the budget from ~150ms to ~9s; (2)
+  when a later query only needs a handful of session_ids (e.g. per-session
+  totals for a LIMIT 60 sessions list), filter the `llm_usage` subquery with
+  `session_id IN (<narrow set>)` rather than aggregating the whole table —
+  `idx_llm_session(session_id, ts)` then turns it into an index lookup
+  instead of a scan. Budget roughly one full `llm_usage` scan per ~150-200ms
+  at this row count; a `< 1s` target caps you at ~4-5 scans total.
