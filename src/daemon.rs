@@ -1,7 +1,7 @@
 //! The ai-obs daemon: HTTP hook endpoint + adaptive sampler + detectors.
 
-use crate::correlator::{snapshot_map, Correlator};
-use crate::store::{now_ms, Store, TokenTotals};
+use crate::correlator::{snapshot_map, Correlator, Session, Span};
+use crate::store::{now_ms, RecentSpanRow, Store, TokenTotals};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,6 +14,13 @@ pub const DEFAULT_PORT: u16 = 8770;
 
 /// Timestamped, refcounted snapshot of `session_token_totals()`.
 type TokenTotalsCache = Arc<Mutex<Option<(Instant, Arc<HashMap<String, TokenTotals>>)>>>;
+
+/// Timestamped, refcounted snapshot of `session_agent_token_totals()`.
+type AgentTokenTotalsCache =
+    Arc<Mutex<Option<(Instant, Arc<HashMap<(String, Option<String>), TokenTotals>>)>>>;
+
+/// Timestamped, refcounted snapshot of `recent_spans_all_sessions()`.
+type RecentSpansCache = Arc<Mutex<Option<(Instant, Arc<HashMap<String, Vec<RecentSpanRow>>>)>>>;
 
 /// (kind, severity, session_id, span_id, pid, message)
 type Finding = (
@@ -43,6 +50,10 @@ pub struct AppState {
     /// the tailer only updates llm_usage every 3s so this saves repeated
     /// full-table scans on rapid /api/top polling.
     pub token_totals_cache: TokenTotalsCache,
+    /// Same idea, per-(session, agent) — feeds the collapsible tree.
+    pub agent_totals_cache: AgentTokenTotalsCache,
+    /// Cached last-10-per-session closed spans — feeds the collapsible tree.
+    pub recent_spans_cache: RecentSpansCache,
 }
 
 pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
@@ -54,6 +65,8 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         started_at: now_ms(),
         sampler_cost: Arc::new(Mutex::new(0.0)),
         token_totals_cache: Arc::new(Mutex::new(None)),
+        agent_totals_cache: Arc::new(Mutex::new(None)),
+        recent_spans_cache: Arc::new(Mutex::new(None)),
     };
 
     // Sampler loop (blocking-ish work on a dedicated thread-friendly task).
@@ -399,9 +412,156 @@ fn token_totals(st: &AppState) -> Arc<HashMap<String, TokenTotals>> {
     map
 }
 
+/// Same caching pattern as [`token_totals`], for the per-agent breakdown.
+fn agent_token_totals(st: &AppState) -> Arc<HashMap<(String, Option<String>), TokenTotals>> {
+    const TTL: Duration = Duration::from_secs(2);
+    {
+        let cache = st.agent_totals_cache.lock().unwrap();
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return map.clone();
+            }
+        }
+    }
+    let map = Arc::new(st.store.session_agent_token_totals().unwrap_or_default());
+    *st.agent_totals_cache.lock().unwrap() = Some((Instant::now(), map.clone()));
+    map
+}
+
+/// Same caching pattern as [`token_totals`], for the last-10-per-session
+/// closed spans used to populate each agent's "recent spans" in the tree.
+fn recent_spans(st: &AppState) -> Arc<HashMap<String, Vec<RecentSpanRow>>> {
+    const TTL: Duration = Duration::from_secs(2);
+    {
+        let cache = st.recent_spans_cache.lock().unwrap();
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return map.clone();
+            }
+        }
+    }
+    let map = Arc::new(st.store.recent_spans_all_sessions(10).unwrap_or_default());
+    *st.recent_spans_cache.lock().unwrap() = Some((Instant::now(), map.clone()));
+    map
+}
+
+#[derive(Default)]
+struct AgentBucket {
+    agent_type: Option<String>,
+    cost_usd: f64,
+    tokens_out: i64,
+    open: Vec<Value>,
+    recent: Vec<Value>,
+}
+
+/// Build the "agents" array for one session: open spans (live, from the
+/// correlator) and recent closed spans (from `tool_span`), grouped by
+/// agent_id (None = main agent), plus each agent's token/cost totals.
+/// Only agents with at least one span or some tokens are included.
+fn build_agents(
+    sess: &Session,
+    agent_totals: &HashMap<(String, Option<String>), TokenTotals>,
+    recent_spans_by_session: &HashMap<String, Vec<RecentSpanRow>>,
+) -> Vec<Value> {
+    let now = now_ms();
+    let mut buckets: HashMap<Option<String>, AgentBucket> = HashMap::new();
+
+    for span in &sess.open_spans {
+        let b = buckets.entry(span.agent_id.clone()).or_default();
+        if b.agent_type.is_none() {
+            b.agent_type = span.agent_type.clone();
+        }
+        b.open.push(open_span_json(span, now));
+    }
+
+    if let Some(rows) = recent_spans_by_session.get(&sess.id) {
+        for r in rows {
+            let b = buckets.entry(r.agent_id.clone()).or_default();
+            if b.agent_type.is_none() {
+                b.agent_type = r.agent_type.clone();
+            }
+            b.recent.push(json!({
+                "span_id": r.span_id,
+                "tool_name": r.tool_name,
+                "cmd_digest": r.cmd_digest,
+                "duration_s": r.duration_ms as f64 / 1000.0,
+                "cpu_s": r.cpu_ns as f64 / 1e9,
+                "peak_mb": r.peak_footprint / 1_000_000,
+                "ok": r.ok,
+                "leaked_count": r.leaked_count,
+                "running": false,
+                "pid": Value::Null,
+            }));
+        }
+    }
+
+    for ((sid, agent_id), totals) in agent_totals {
+        if sid != &sess.id {
+            continue;
+        }
+        let b = buckets.entry(agent_id.clone()).or_default();
+        b.cost_usd = totals.cost_usd;
+        b.tokens_out = totals.output_tokens;
+    }
+
+    let mut keys: Vec<Option<String>> = buckets.keys().cloned().collect();
+    keys.sort_by(|a, b| match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y),
+    });
+
+    keys.into_iter()
+        .map(|k| {
+            let b = buckets.remove(&k).unwrap();
+            json!({
+                "agent_id": k,
+                "agent_type": b.agent_type,
+                "cost_usd": (b.cost_usd * 100.0).round() / 100.0,
+                "tokens_out": b.tokens_out,
+                "open_spans": b.open,
+                "recent_spans": b.recent,
+            })
+        })
+        .collect()
+}
+
+/// JSON for one live/open span: elapsed time, sampled cpu-seconds and peak
+/// footprint summed over its currently-attributed processes, and the pid of
+/// its heaviest (most cpu-ns) live process, if any.
+fn open_span_json(span: &Span, now: i64) -> Value {
+    let mut cpu_ns_total: u64 = 0;
+    let mut peak: u64 = 0;
+    let mut heaviest: Option<(i32, u64)> = None;
+    for (pid, agg) in &span.procs {
+        let cpu = agg.last_usage.cpu_user_ns + agg.last_usage.cpu_sys_ns;
+        cpu_ns_total += cpu;
+        peak = peak.max(agg.peak_footprint);
+        if heaviest.map(|(_, c)| cpu > c).unwrap_or(true) {
+            heaviest = Some((*pid, cpu));
+        }
+    }
+    json!({
+        "tool_use_id": span.tool_use_id,
+        "tool_name": span.tool_name,
+        "cmd_digest": span.cmd_digest,
+        "duration_s": ((now - span.started_at).max(0)) as f64 / 1000.0,
+        "cpu_s": cpu_ns_total as f64 / 1e9,
+        "peak_mb": peak / 1_000_000,
+        "ok": Value::Null,
+        "leaked_count": 0,
+        "running": true,
+        "pid": heaviest.map(|(pid, _)| pid),
+    })
+}
+
 async fn api_top(State(st): State<AppState>) -> Json<Value> {
     // Query the store outside the correlator lock.
     let totals = token_totals(&st);
+    let agent_totals = agent_token_totals(&st);
+    let recent = recent_spans(&st);
+    let now = now_ms();
     let sessions: Vec<Value> = {
         let corr = st.corr.lock().unwrap();
         let mut rows: Vec<_> = corr.sessions.values().collect();
@@ -426,6 +586,8 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                         .and_then(|r| r.rsplit('/').next()).unwrap_or("?"),
                     "project_root": s.project_root,
                     "claude_pid": s.claude_pid,
+                    "started_at": s.started_at,
+                    "duration_s": ((now - s.started_at).max(0)) as f64 / 1000.0,
                     "cpu_pct": (s.cpu_pct * 10.0).round() / 10.0,
                     "footprint_mb": s.footprint / 1_000_000,
                     "procs": s.proc_count,
@@ -436,6 +598,7 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                     "cache_read": cache_read,
                     "cost_usd": cost_usd,
                     "unpriced": unpriced,
+                    "agents": build_agents(s, &agent_totals, &recent),
                 })
             })
             .collect()

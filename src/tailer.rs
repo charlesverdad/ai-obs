@@ -59,13 +59,29 @@ pub fn scan_once(store: &Store, root: &Path) -> usize {
             if meta.len() <= offset {
                 continue; // nothing new (or truncated — leave alone)
             }
-            new_rows += tail_file(store, &path, offset).unwrap_or(0);
+            let agent_id = agent_id_from_path(&path);
+            new_rows += tail_file(store, &path, offset, agent_id.as_deref()).unwrap_or(0);
         }
     }
     new_rows
 }
 
-fn tail_file(store: &Store, path: &Path, offset: u64) -> anyhow::Result<usize> {
+/// Subagent transcripts live at `.../subagents/agent-<id>.jsonl` (observed
+/// both directly under a session dir and nested one level deeper under a
+/// session-named dir). Extract `<id>` from the filename; `None` means this
+/// is a main-transcript file.
+fn agent_id_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".jsonl")?;
+    stem.strip_prefix("agent-").map(|s| s.to_string())
+}
+
+fn tail_file(
+    store: &Store,
+    path: &Path,
+    offset: u64,
+    agent_id: Option<&str>,
+) -> anyhow::Result<usize> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let f = std::fs::File::open(path)?;
     let mut r = BufReader::new(f);
@@ -86,7 +102,7 @@ fn tail_file(store: &Store, path: &Path, offset: u64) -> anyhow::Result<usize> {
         }
         pos += n as u64;
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if ingest_record(store, &v).unwrap_or(false) {
+            if ingest_record(store, &v, agent_id).unwrap_or(false) {
                 count += 1;
             }
         }
@@ -135,7 +151,7 @@ pub fn rfc3339_to_ms(s: &str) -> Option<i64> {
 }
 
 /// Returns Ok(true) when a new llm_usage row was written.
-fn ingest_record(store: &Store, v: &Value) -> anyhow::Result<bool> {
+fn ingest_record(store: &Store, v: &Value, agent_id: Option<&str>) -> anyhow::Result<bool> {
     let rtype = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     let sid = get_str(v, "sessionId").unwrap_or_default();
     match rtype {
@@ -186,6 +202,7 @@ fn ingest_record(store: &Store, v: &Value) -> anyhow::Result<bool> {
                 } else {
                     "unknown"
                 },
+                agent_id: agent_id.map(|s| s.to_string()),
             };
             Ok(store.insert_llm_usage(&rec)?)
         }
@@ -236,6 +253,60 @@ mod tests {
             Some(1781314857084)
         );
         assert_eq!(rfc3339_to_ms("garbage"), None);
+    }
+
+    #[test]
+    fn agent_id_extraction() {
+        assert_eq!(
+            agent_id_from_path(Path::new(
+                "/x/projects/proj/sess1/subagents/agent-abc123.jsonl"
+            )),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            agent_id_from_path(Path::new(
+                "/x/projects/proj/sess1/subagents/sess1/agent-abc123.jsonl"
+            )),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            agent_id_from_path(Path::new("/x/projects/proj/sess1.jsonl")),
+            None
+        );
+        assert_eq!(
+            agent_id_from_path(Path::new("/x/agent-.jsonl")),
+            Some("".to_string())
+        );
+    }
+
+    #[test]
+    fn subagent_transcript_sets_agent_id() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-tail-sub-{}", std::process::id()));
+        let sub = dir.join("projects/-Users-x-work-demo/sess1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let db = dir.join("t.db");
+        let store = Store::open(&db).unwrap();
+
+        let jsonl = sub.join("agent-testagent1.jsonl");
+        let rec = serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "uuid": "u1",
+            "timestamp": "2026-08-13T01:00:00.000Z",
+            "isSidechain": true,
+            "message": {"model": "claude-sonnet-5",
+                "usage": {"input_tokens": 10, "output_tokens": 20}}
+        });
+        std::fs::write(&jsonl, format!("{rec}\n")).unwrap();
+
+        let n = scan_once(&store, &dir.join("projects"));
+        assert_eq!(n, 1);
+        let rows = store
+            .query_json(
+                "SELECT agent_id FROM llm_usage WHERE message_uuid='u1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["agent_id"], "testagent1");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

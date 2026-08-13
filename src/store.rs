@@ -84,6 +84,23 @@ pub struct LlmUsageRecord {
     pub cache_creation: i64,
     pub cost_usd: Option<f64>,
     pub cost_source: &'static str,
+    /// Subagent id (from `.../subagents/agent-<id>.jsonl`); NULL for the
+    /// main transcript.
+    pub agent_id: Option<String>,
+}
+
+/// One closed span, as returned by [`Store::recent_spans_all_sessions`].
+pub struct RecentSpanRow {
+    pub span_id: i64,
+    pub tool_name: String,
+    pub cmd_digest: Option<String>,
+    pub duration_ms: i64,
+    pub cpu_ns: u64,
+    pub peak_footprint: u64,
+    pub ok: Option<bool>,
+    pub leaked_count: i32,
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
 }
 
 const SCHEMA: &str = r#"
@@ -150,7 +167,8 @@ CREATE TABLE IF NOT EXISTS llm_usage (
   model TEXT, is_sidechain INTEGER,
   input_tokens INTEGER, output_tokens INTEGER,
   cache_read INTEGER, cache_creation INTEGER,
-  cost_usd REAL, cost_source TEXT
+  cost_usd REAL, cost_source TEXT,
+  agent_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_usage(session_id, ts);
 CREATE TABLE IF NOT EXISTS tailer_checkpoint (
@@ -170,6 +188,30 @@ CREATE TABLE IF NOT EXISTS finding (
 );
 "#;
 
+/// Schema migrations that ALTER an existing table rather than CREATE it —
+/// needed because `CREATE TABLE IF NOT EXISTS` in [`SCHEMA`] is a no-op
+/// against a database the daemon already created before a column existed.
+/// Guarded by `pragma table_info` so re-running against an already-migrated
+/// (or brand-new, already-correct) db is a harmless no-op: never drops data.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_agent_id = {
+        let mut stmt = conn.prepare("PRAGMA table_info(llm_usage)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for n in names {
+            if n? == "agent_id" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_agent_id {
+        conn.execute("ALTER TABLE llm_usage ADD COLUMN agent_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
@@ -179,6 +221,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -331,8 +374,8 @@ impl Store {
         let n = conn.execute(
             "INSERT OR IGNORE INTO llm_usage(session_id, message_uuid, request_id, ts, model,
                is_sidechain, input_tokens, output_tokens, cache_read, cache_creation,
-               cost_usd, cost_source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               cost_usd, cost_source, agent_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 r.session_id,
                 r.message_uuid,
@@ -346,6 +389,7 @@ impl Store {
                 r.cache_creation,
                 r.cost_usd,
                 r.cost_source,
+                r.agent_id,
             ],
         )?;
         Ok(n > 0)
@@ -383,6 +427,89 @@ impl Store {
         for row in rows {
             let (sid, totals) = row?;
             out.insert(sid, totals);
+        }
+        Ok(out)
+    }
+
+    /// Per-(session_id, agent_id) token/cost totals from `llm_usage`.
+    /// `agent_id` is `None` for the main transcript.
+    pub fn session_agent_token_totals(
+        &self,
+    ) -> Result<HashMap<(String, Option<String>), TokenTotals>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, agent_id,
+                COALESCE(SUM(input_tokens),0),
+                COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read),0),
+                COALESCE(SUM(cache_creation),0),
+                COALESCE(SUM(COALESCE(cost_usd,0)),0),
+                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+             FROM llm_usage
+             GROUP BY session_id, agent_id",
+        )?;
+        let mut out = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                TokenTotals {
+                    input_tokens: r.get(2)?,
+                    output_tokens: r.get(3)?,
+                    cache_read: r.get(4)?,
+                    cache_creation: r.get(5)?,
+                    cost_usd: r.get(6)?,
+                    unpriced: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (sid, agent_id, totals) = row?;
+            out.insert((sid, agent_id), totals);
+        }
+        Ok(out)
+    }
+
+    /// Last `limit` closed spans per session (by `ended_at` desc), across
+    /// all sessions in one query via a window function. Used for the
+    /// collapsible tree's "recent spans" under each agent.
+    pub fn recent_spans_all_sessions(
+        &self,
+        limit: u32,
+    ) -> Result<HashMap<String, Vec<RecentSpanRow>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, id, tool_name, cmd_digest, started_at, ended_at, ok,
+                    COALESCE(cpu_ns, cpu_ns_sampled), peak_footprint, leaked_count,
+                    agent_id, agent_type
+             FROM (
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ended_at DESC) rn
+               FROM tool_span WHERE ended_at IS NOT NULL
+             ) WHERE rn <= ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            let started_at: i64 = r.get(4)?;
+            let ended_at: i64 = r.get(5)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                RecentSpanRow {
+                    span_id: r.get(1)?,
+                    tool_name: r.get(2)?,
+                    cmd_digest: r.get(3)?,
+                    duration_ms: ended_at - started_at,
+                    ok: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                    cpu_ns: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                    peak_footprint: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64,
+                    leaked_count: r.get::<_, Option<i64>>(9)?.unwrap_or(0) as i32,
+                    agent_id: r.get(10)?,
+                    agent_type: r.get(11)?,
+                },
+            ))
+        })?;
+        let mut out: HashMap<String, Vec<RecentSpanRow>> = HashMap::new();
+        for row in rows {
+            let (sid, rec) = row?;
+            out.entry(sid).or_default().push(rec);
         }
         Ok(out)
     }
@@ -547,6 +674,76 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tool_name"], "Bash");
         assert_eq!(rows[0]["leaked_count"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_preserves_data() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            let s = Store::open(&db).unwrap();
+            s.insert_llm_usage(&LlmUsageRecord {
+                session_id: "s1".into(),
+                message_uuid: "u1".into(),
+                request_id: None,
+                ts: 1,
+                model: "m".into(),
+                is_sidechain: false,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read: 0,
+                cache_creation: 0,
+                cost_usd: Some(0.1),
+                cost_source: "computed",
+                agent_id: Some("agent1".into()),
+            })
+            .unwrap();
+        }
+        // Reopening (simulating a daemon restart against an existing db)
+        // must not error and must not lose the row already there.
+        let s2 = Store::open(&db).unwrap();
+        let totals = s2.session_agent_token_totals().unwrap();
+        let t = totals
+            .get(&("s1".to_string(), Some("agent1".to_string())))
+            .unwrap();
+        assert_eq!(t.input_tokens, 10);
+        assert_eq!(t.output_tokens, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_agent_token_totals_groups_main_and_subagents() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        let mk = |uuid: &str, agent_id: Option<&str>, out: i64| LlmUsageRecord {
+            session_id: "s1".into(),
+            message_uuid: uuid.into(),
+            request_id: None,
+            ts: 1,
+            model: "m".into(),
+            is_sidechain: agent_id.is_some(),
+            input_tokens: 1,
+            output_tokens: out,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: Some(0.01 * out as f64),
+            cost_source: "computed",
+            agent_id: agent_id.map(|a| a.to_string()),
+        };
+        s.insert_llm_usage(&mk("u1", None, 100)).unwrap();
+        s.insert_llm_usage(&mk("u2", Some("agentA"), 50)).unwrap();
+        s.insert_llm_usage(&mk("u3", Some("agentA"), 25)).unwrap();
+
+        let totals = s.session_agent_token_totals().unwrap();
+        assert_eq!(totals[&("s1".to_string(), None)].output_tokens, 100);
+        assert_eq!(
+            totals[&("s1".to_string(), Some("agentA".to_string()))].output_tokens,
+            75
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
