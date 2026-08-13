@@ -320,6 +320,25 @@
     }[c]));
   }
 
+  // ` → binary` suffix shown next to a cmd_digest when process telemetry
+  // (proc_stat, sampled per tool-call) caught a dominant child process that
+  // differs from the digest's own first word — e.g. `just verify → rustc`.
+  // Empty when there's no telemetry (fast/transient calls) or the dominant
+  // binary is just the digest's own command restated.
+  function binarySuffixPlain(cmd, topBinary) {
+    if (!topBinary) return '';
+    const firstWord = (cmd || '').split(/\s+/)[0] || '';
+    if (topBinary === firstWord) return '';
+    return ' → ' + topBinary;
+  }
+
+  // HTML-escaped variant for call sites that interpolate directly into a
+  // template string without a further esc() pass over the whole label.
+  function binarySuffix(cmd, topBinary) {
+    const plain = binarySuffixPlain(cmd, topBinary);
+    return plain ? ' → ' + esc(topBinary) : '';
+  }
+
   // ---------------- state ----------------
 
   const state = {
@@ -605,7 +624,7 @@
     const heaviest = historyData.heaviest || [];
     document.getElementById('heaviest').innerHTML = heaviest.map((h) => `
       <div class="heavy-row">
-        <span class="col-flex" style="color:var(--text-hi)">${esc(h.tool)}${h.cmd ? ' · ' + esc(h.cmd) : ''}</span>
+        <span class="col-flex" style="color:var(--text-hi)">${esc(h.tool)}${h.cmd ? ' · ' + esc(h.cmd) : ''}${binarySuffix(h.cmd, h.top_binary)}</span>
         <span style="width:46px;color:var(--text-dim2)" class="col-r">${h.calls}</span>
         <span style="width:50px;color:var(--text-mid)" class="col-r">${h.cpu_s.toFixed(1)}</span>
         <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtMem(h.peak_mb)}</span>
@@ -872,7 +891,7 @@
     const labelColor = failed ? 'var(--red)' : 'var(--text-dim)';
     const note = failed ? 'failed' : (g.leaked > 0 ? `${g.leaked} leaked` : '');
     const noteColor = failed || g.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
-    const label = g.cmd ? `${g.tool} · ${g.cmd}` : g.tool;
+    const label = (g.cmd ? `${g.tool} · ${g.cmd}` : g.tool) + binarySuffixPlain(g.cmd, g.top_binary);
     return `
       <div class="gantt-row${nested ? ' nested' : ''}">
         <span class="gantt-label" style="color:${labelColor}" title="${esc(label)}">${esc(label)}</span>

@@ -66,17 +66,42 @@ pub fn run(opts: &ReportOpts) -> Result<()> {
         &argrefs,
     )?;
 
+    // `top_binary`: the dominant real binary (by cpu_ns, shells excluded)
+    // among each (project, tool, digest) group's spans' proc_stat children —
+    // same single-grouped-join shape as history.rs's heaviest query (see its
+    // comment for why): a `scoped` CTE narrows tool_span to this report's
+    // filter once, `bin_agg`/`ranked` aggregate proc_stat per group, and the
+    // outer query LEFT JOINs the winner (rn=1) onto the per-group rollup.
     let top_commands = store.query_json(
         &format!(
-            "SELECT pr.name project, t.tool_name, t.cmd_digest,
+            "WITH scoped AS (
+               SELECT t.id, pr.name project, t.tool_name, t.cmd_digest, t.cpu_ns, t.cpu_ns_sampled, t.peak_footprint
+               FROM tool_span t
+               JOIN session s ON s.id = t.session_id
+               LEFT JOIN project pr ON pr.id = s.project_id
+               WHERE 1=1 {filter}
+             ),
+             bin_agg AS (
+               SELECT sc.project, sc.tool_name, sc.cmd_digest, ps.name,
+                      SUM(COALESCE(ps.cpu_user_ns,0)+COALESCE(ps.cpu_sys_ns,0)) cpu_ns
+               FROM proc_stat ps JOIN scoped sc ON sc.id = ps.span_id
+               WHERE ps.name NOT IN ('sh','bash','zsh','dash')
+               GROUP BY sc.project, sc.tool_name, sc.cmd_digest, ps.name
+             ),
+             ranked AS (
+               SELECT project, tool_name, cmd_digest, name,
+                      ROW_NUMBER() OVER (PARTITION BY project, tool_name, cmd_digest ORDER BY cpu_ns DESC) rn
+               FROM bin_agg
+             )
+             SELECT sc.project project, sc.tool_name, sc.cmd_digest,
                 COUNT(*) calls,
-                ROUND(SUM(COALESCE(t.cpu_ns, t.cpu_ns_sampled))/1e9,1) cpu_seconds,
-                ROUND(MAX(t.peak_footprint)/1e6) peak_mb
-             FROM tool_span t
-             JOIN session s ON s.id = t.session_id
-             LEFT JOIN project pr ON pr.id = s.project_id
-             WHERE 1=1 {filter}
-             GROUP BY pr.name, t.tool_name, t.cmd_digest
+                ROUND(SUM(COALESCE(sc.cpu_ns, sc.cpu_ns_sampled))/1e9,1) cpu_seconds,
+                ROUND(MAX(sc.peak_footprint)/1e6) peak_mb,
+                MAX(r.name) top_binary
+             FROM scoped sc
+             LEFT JOIN ranked r ON r.project IS sc.project AND r.tool_name = sc.tool_name
+               AND r.cmd_digest IS sc.cmd_digest AND r.rn = 1
+             GROUP BY sc.project, sc.tool_name, sc.cmd_digest
              ORDER BY cpu_seconds DESC LIMIT 15"
         ),
         &argrefs,
@@ -153,11 +178,23 @@ fn print_markdown(v: &Value) {
     println!("| project | tool | command | calls | CPU s | peak MB |");
     println!("|---|---|---|---:|---:|---:|");
     for r in v["top_commands"].as_array().unwrap_or(&vec![]) {
+        let cmd = r["cmd_digest"].as_str().unwrap_or("-");
+        // Append `→ binary` when the sampler caught a dominant child
+        // process that differs from the digest's own first word — e.g.
+        // `just verify → rustc` — so the row still points at real work
+        // even when the digest itself is wrapper noise.
+        let top_binary = r["top_binary"].as_str();
+        let cmd_display = match top_binary {
+            Some(bin) if !bin.is_empty() && Some(bin) != cmd.split_whitespace().next() => {
+                format!("{cmd} → {bin}")
+            }
+            _ => cmd.to_string(),
+        };
         println!(
             "| {} | {} | {} | {} | {} | {} |",
             r["project"].as_str().unwrap_or("?"),
             r["tool_name"].as_str().unwrap_or("?"),
-            r["cmd_digest"].as_str().unwrap_or("-"),
+            cmd_display,
             r["calls"],
             r["cpu_seconds"],
             r["peak_mb"]
