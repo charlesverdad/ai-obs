@@ -149,3 +149,37 @@ and load-bearing — this is not a changelog.
   `llm_usage`/`tool_span` is not (see the dashboard-aggregate-queries note
   above) once used inside the *list* query, though it's fine for the
   single-row `/api/session/{id}` lookup.
+
+- **`cmd_digest` wrapper unwrapping (`correlator.rs`)**: reconstructing a
+  "rest of the command line" string by plain `tokens.join(" ")` after a
+  prefix wrapper (sudo/time/env/...) strips its own flags silently
+  destroys quote grouping on any remaining token that itself came from a
+  quoted arg (e.g. an already-extracted `sh -c '...'` payload) — the next
+  `tokenize()` pass then splits it back into multiple tokens instead of
+  treating it as one, breaking further recursive unwrapping (e.g.
+  `sudo nix-shell --run "timeout 5 cargo build"`, where `--run`'s argument
+  needs to survive the `sudo`-stripping step intact). Fix: requote any
+  token containing whitespace (`'...'`, or `"..."` if the token itself
+  contains a single quote) before rejoining — see `rejoin`/`requote`. Only
+  needed for strings fed back into `unwrap_wrappers`/`tokenize`, never for
+  a terminal return value that `digest_words` will `split_whitespace()`
+  directly (requoted text would show up as literal quote characters there).
+
+- **SQLite window functions are available**: the bundled `rusqlite`
+  (`features = ["bundled"]`) ships SQLite 3.48 — `ROW_NUMBER() OVER
+  (PARTITION BY ... ORDER BY ...)` works fine for "pick the top row per
+  group" queries (e.g. dominant-binary-per-digest-group in
+  `history.rs`/`report.rs`). Prefer a CTE + window function + single
+  `LEFT JOIN` over a per-row correlated subquery — same N+1 concern as the
+  llm_usage note above, just against `proc_stat` instead. Use `x IS y` (not
+  `x = y`) when joining on a nullable column like `cmd_digest`, since SQL
+  `NULL = NULL` is false.
+
+- **Verifying dashboard queries against real data**: `sqlite3 <prod db>
+  ".backup '<scratch path>'"` makes a safe, fully-independent read-only
+  copy (WAL included) without touching the live db; point a scratch daemon
+  at it via `AI_OBS_DB=<copy> AI_OBS_PORT=18xxx`. Timing `/api/history`
+  against a ~100MB / 300k-row copy this way found the `top_binary`
+  dominant-binary CTE added no measurable overhead (~890ms before and
+  after, days=30) — `proc_stat` is small enough that the extra grouped
+  join is noise next to the `llm_usage` scan.

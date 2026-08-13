@@ -181,14 +181,305 @@ fn now_ms() -> i64 {
     crate::store::now_ms()
 }
 
+/// Cap on how much of a single command string we'll ever tokenize. Guards
+/// against pathological (megabyte-scale) input without needing to thread a
+/// fuel counter through every helper — since each recursive unwrap step
+/// only ever operates on a substring of its input (never a copy that grows
+/// it), capping the initial input size bounds all downstream work too.
+const MAX_DIGEST_INPUT: usize = 64 * 1024;
+
+/// Cap on wrapper-unwrap recursion (nix-shell --run 'sh -c "..."' etc.).
+const MAX_UNWRAP_DEPTH: u32 = 5;
+
 /// Normalise a Bash command to a compact, privacy-preserving shape:
-/// first two words, executables reduced to basenames, no flags/paths.
+/// recursively unwrap wrapper commands (`nix-shell --run`, `sh -c`, `sudo`,
+/// `timeout`, `cd x &&`, ...) to reach the innermost real command, then take
+/// its first shell segment, first two words, executables reduced to
+/// basenames, no flags/paths. Never panics on malformed input (unbalanced
+/// quotes, empty strings, non-ASCII, huge strings) — worst case is a
+/// best-effort digest.
 pub fn cmd_digest(command: &str) -> String {
-    // Only digest the first shell segment: stop at the first separator
-    // that would start a new command (;, |, &&, ||, newline).
-    let first_segment = split_first_shell_segment(command);
+    let command = truncate_at_char_boundary(command, MAX_DIGEST_INPUT);
+    let unwrapped = unwrap_wrappers(command, MAX_UNWRAP_DEPTH);
+    digest_words(&unwrapped)
+}
+
+fn truncate_at_char_boundary(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
+    }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Shell-word tokenizer: splits on whitespace, treats a `'...'` or `"..."`
+/// run as a single token (quotes stripped, contents kept verbatim including
+/// any inner whitespace) so `sh -c 'cargo test --all'` tokenizes to
+/// `["sh", "-c", "cargo test --all"]`. No escape processing. An unterminated
+/// quote simply consumes to the end of the string instead of erroring —
+/// this must never panic on any input.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut has_cur = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' => {
+                if has_cur {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_cur = false;
+                }
+            }
+            '\'' | '"' => {
+                has_cur = true;
+                for c2 in chars.by_ref() {
+                    if c2 == c {
+                        break;
+                    }
+                    cur.push(c2);
+                }
+            }
+            _ => {
+                has_cur = true;
+                cur.push(c);
+            }
+        }
+    }
+    if has_cur {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Rejoin a token slice into a command string suitable for feeding back
+/// into [`unwrap_wrappers`]/[`tokenize`]. Plain `.join(" ")` would lose the
+/// quote grouping of any token that itself contains whitespace (e.g. an
+/// already-extracted `sh -c '...'` inner command passed through an outer
+/// `sudo`/`time` prefix), silently splitting it into multiple tokens on the
+/// next tokenize pass. Requote such tokens so they round-trip as one token.
+fn rejoin(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|t| requote(t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn requote(tok: &str) -> String {
+    if !tok.chars().any(|c| c.is_whitespace()) {
+        return tok.to_string();
+    }
+    if !tok.contains('\'') {
+        format!("'{tok}'")
+    } else if !tok.contains('"') {
+        format!("\"{tok}\"")
+    } else {
+        // Contains both quote kinds and whitespace: no clean requoting
+        // available. Best effort — a later tokenize() will just split it
+        // into multiple tokens instead of one; never panics either way.
+        tok.to_string()
+    }
+}
+
+/// A token that looks like a leading env assignment (`FOO=bar`, `FOO=`),
+/// i.e. `NAME=...` where `NAME` is a shell-identifier-shaped prefix.
+fn is_env_assignment(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    if eq == 0 {
+        return false;
+    }
+    let name = &tok[..eq];
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Per-wrapper table of short flags that take their value as the *next*
+/// token (`xargs -P 4`, `env -u PATH`), as opposed to either taking no
+/// value or an attached value (`stdbuf -oL`, which needs no entry here —
+/// it's a single token already, not a separate `-o` `L` pair). Matched
+/// against the exact flag token, so `-P4`/`-uPATH` (attached forms) don't
+/// hit this table and are just skipped as ordinary flags, unchanged.
+fn flag_takes_arg(head_base: &str, flag: &str) -> bool {
+    matches!(
+        (head_base, flag),
+        (
+            "xargs",
+            "-P" | "-n" | "-L" | "-s" | "-I" | "-E" | "-a" | "-d"
+        ) | ("env", "-u" | "-S" | "-C" | "-P")
+            | ("sudo", "-u" | "-g" | "-p" | "-h")
+            | ("nice", "-n")
+            | ("timeout", "-k" | "-s")
+            | ("caffeinate", "-t" | "-w")
+            | ("stdbuf", "-o" | "-e" | "-i")
+    )
+}
+
+/// Recursively unwrap wrapper commands (`nix-shell --run`, `sh -c`, `sudo`,
+/// `timeout`, `env`, ...) down to the innermost real command line. Returns
+/// the unwrapped command as a plain (space-joined, quote-stripped) string
+/// for [`digest_words`] to segment/truncate as usual. Depth-limited; never
+/// panics.
+fn unwrap_wrappers(command: &str, depth: u32) -> String {
+    if depth == 0 {
+        return command.to_string();
+    }
+    let tokens = tokenize(command);
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let mut i = 0;
+    while i < tokens.len() && is_env_assignment(&tokens[i]) {
+        i += 1;
+    }
+    if i >= tokens.len() {
+        return String::new();
+    }
+    let head = tokens[i].as_str();
+    let head_base = head.rsplit('/').next().unwrap_or(head);
+
+    // Wrappers whose whole point is a quoted inner command line: find the
+    // flag that introduces it and recurse on its argument.
+    match head_base {
+        "nix-shell" => {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                if tokens[j] == "--run" || tokens[j] == "--command" {
+                    if let Some(inner) = tokens.get(j + 1) {
+                        return unwrap_wrappers(inner, depth - 1);
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            return "nix-shell".to_string();
+        }
+        "sh" | "bash" | "zsh" | "dash" => {
+            let mut j = i + 1;
+            while let Some(t) = tokens.get(j) {
+                if !t.starts_with('-') {
+                    break;
+                }
+                if t.contains('c') {
+                    if let Some(inner) = tokens.get(j + 1) {
+                        return unwrap_wrappers(inner, depth - 1);
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            return head_base.to_string();
+        }
+        _ => {}
+    }
+
+    // Prefix wrappers that take the rest of the line as the command to run,
+    // after skipping their own flags (and, for `env`, leading VAR=val
+    // assignments too).
+    let is_prefix_wrapper = matches!(
+        head_base,
+        "env"
+            | "sudo"
+            | "time"
+            | "timeout"
+            | "caffeinate"
+            | "stdbuf"
+            | "command"
+            | "exec"
+            | "arch"
+            | "nohup"
+            | "nice"
+            | "xargs"
+    );
+    if is_prefix_wrapper {
+        let mut j = i + 1;
+        let mut skipped_duration_for_timeout = head_base != "timeout";
+        while let Some(t) = tokens.get(j) {
+            if head_base == "env" && is_env_assignment(t) {
+                j += 1;
+                continue;
+            }
+            if t.starts_with('-') {
+                let consumes_arg = flag_takes_arg(head_base, t);
+                j += 1;
+                if consumes_arg && tokens.get(j).is_some_and(|a| !a.starts_with('-')) {
+                    j += 1;
+                }
+                continue;
+            }
+            if head_base == "timeout" && !skipped_duration_for_timeout {
+                // First bare token after flags is the duration, not the command.
+                skipped_duration_for_timeout = true;
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j < tokens.len() {
+            let rest = rejoin(&tokens[j..]);
+            return unwrap_wrappers(&rest, depth - 1);
+        }
+        return head_base.to_string();
+    }
+
+    // Not a recognised wrapper: reassemble from the first non-env token
+    // onward (quotes stripped, whitespace normalised) for `digest_words` to
+    // handle as usual.
+    tokens[i..].join(" ")
+}
+
+/// Apply the final digest rules to an already-unwrapped command: first
+/// shell segment, skipping over `cd`/`export`/`set` segments to the next
+/// one (when there is one), first two words, executables reduced to
+/// basenames.
+fn digest_words(command: &str) -> String {
+    let mut remaining = command;
+    // Bounded by `remaining` strictly shrinking each iteration (a segment
+    // plus its separator is consumed), so this always terminates within
+    // `command.len()` iterations — the explicit cap is just defense in depth.
+    for _ in 0..256 {
+        let (seg, rest) = split_off_first_segment(remaining);
+        let seg_head_base = seg.split_whitespace().next().map(|w| {
+            let w = w.strip_suffix(';').unwrap_or(w);
+            w.rsplit('/').next().unwrap_or(w)
+        });
+        let is_skip_cmd = matches!(seg_head_base, Some("cd") | Some("export") | Some("set"));
+        if is_skip_cmd && !rest.is_empty() {
+            remaining = rest;
+            continue;
+        }
+        return extract_two_words(seg);
+    }
+    extract_two_words(remaining)
+}
+
+/// Split a shell command at the first occurrence of `;`, `|`, `&&`, or a
+/// newline (whichever comes first). Returns `(segment, rest_after_separator)`;
+/// `rest` is empty when no separator was found.
+fn split_off_first_segment(command: &str) -> (&str, &str) {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' | b'|' | b'\n' => return (&command[..i], &command[i + 1..]),
+            b'&' if bytes.get(i + 1) == Some(&b'&') => return (&command[..i], &command[i + 2..]),
+            _ => i += 1,
+        }
+    }
+    (command, "")
+}
+
+fn extract_two_words(segment: &str) -> String {
     let mut words = Vec::new();
-    for w in first_segment.split_whitespace() {
+    for w in segment.split_whitespace() {
         // Skip leading env assignments (FOO=bar cmd).
         if words.is_empty() && w.contains('=') && !w.starts_with('/') {
             continue;
@@ -211,21 +502,6 @@ pub fn cmd_digest(command: &str) -> String {
     } else {
         words.join(" ")
     }
-}
-
-/// Split a shell command at the first occurrence of `;`, `|`, `&&`, `||`, or
-/// a newline (whichever comes first) and return everything before it.
-fn split_first_shell_segment(command: &str) -> &str {
-    let bytes = command.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b';' | b'|' | b'\n' => return &command[..i],
-            b'&' if bytes.get(i + 1) == Some(&b'&') => return &command[..i],
-            _ => i += 1,
-        }
-    }
-    command
 }
 
 impl Correlator {
@@ -760,6 +1036,194 @@ mod tests {
         );
         assert_eq!(cmd_digest("cargo build && cargo test"), "cargo build");
         assert_eq!(cmd_digest("ls | head"), "ls");
+    }
+
+    // ---- wrapper unwrapping (Part A) ----
+
+    #[test]
+    fn digest_unwraps_nix_shell_run() {
+        assert_eq!(
+            cmd_digest(r#"nix-shell --run "cargo test --workspace""#),
+            "cargo test"
+        );
+        assert_eq!(
+            cmd_digest("nix-shell --command 'cargo fmt --check'"),
+            "cargo fmt"
+        );
+        // -p flags before --run don't confuse the scan for --run.
+        assert_eq!(
+            cmd_digest(r#"nix-shell -p jq --run "jq . file.json""#),
+            "jq ."
+        );
+    }
+
+    #[test]
+    fn digest_bare_nix_shell_stays_nix_shell() {
+        assert_eq!(cmd_digest("nix-shell"), "nix-shell");
+        assert_eq!(cmd_digest("nix-shell -p jq"), "nix-shell");
+    }
+
+    #[test]
+    fn digest_unwraps_shell_dash_c() {
+        assert_eq!(cmd_digest("sh -c 'npm run build'"), "npm run");
+        assert_eq!(cmd_digest("bash -c \"cargo build\""), "cargo build");
+        assert_eq!(cmd_digest("zsh -c 'ls -la'"), "ls");
+        assert_eq!(cmd_digest("bash -lc 'cargo test'"), "cargo test");
+    }
+
+    #[test]
+    fn digest_skips_leading_env_assignments() {
+        assert_eq!(cmd_digest("FOO=bar BAZ=1 cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_unwraps_env_prefix() {
+        assert_eq!(cmd_digest("env FOO=1 cargo build"), "cargo build");
+        assert_eq!(cmd_digest("env -i cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_unwraps_sudo_time_and_combinations() {
+        assert_eq!(cmd_digest("sudo cargo build"), "cargo build");
+        assert_eq!(cmd_digest("time cargo build"), "cargo build");
+        assert_eq!(cmd_digest("FOO=1 sudo -E time cargo build"), "cargo build");
+        assert_eq!(cmd_digest("sudo -u root cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_unwraps_timeout_with_duration() {
+        assert_eq!(cmd_digest("timeout 5 cargo test"), "cargo test");
+        assert_eq!(cmd_digest("timeout -k 10 30 cargo test"), "cargo test");
+        assert_eq!(cmd_digest("timeout 5"), "timeout");
+    }
+
+    #[test]
+    fn digest_unwraps_caffeinate() {
+        assert_eq!(cmd_digest("caffeinate -dims ./long_job.sh"), "long_job.sh");
+        assert_eq!(cmd_digest("caffeinate cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_unwraps_stdbuf_command_exec_arch_nohup_nice() {
+        assert_eq!(cmd_digest("stdbuf -oL cargo build"), "cargo build");
+        assert_eq!(cmd_digest("command cargo build"), "cargo build");
+        assert_eq!(cmd_digest("exec cargo build"), "cargo build");
+        assert_eq!(cmd_digest("arch -arm64 cargo build"), "cargo build");
+        assert_eq!(cmd_digest("nohup cargo build"), "cargo build");
+        assert_eq!(cmd_digest("nice cargo build"), "cargo build");
+        assert_eq!(cmd_digest("nice -n 10 cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_unwraps_xargs() {
+        assert_eq!(cmd_digest("xargs rustfmt"), "rustfmt");
+        assert_eq!(cmd_digest("xargs -0 rustfmt"), "rustfmt");
+        assert_eq!(cmd_digest("xargs"), "xargs");
+    }
+
+    #[test]
+    fn digest_handles_value_taking_flags_separately() {
+        // Regression: a separate-token flag argument (e.g. xargs's `-P 4`)
+        // must not be mistaken for the wrapped command itself.
+        assert_eq!(cmd_digest("xargs -P 4 cargo build"), "cargo build");
+        assert_eq!(cmd_digest("env -u PATH ls"), "ls");
+        assert_eq!(cmd_digest("caffeinate -t 3600 ./job.sh"), "job.sh");
+        // Other documented value-taking flags, one per wrapper.
+        assert_eq!(cmd_digest("xargs -n 1 echo"), "echo");
+        assert_eq!(cmd_digest("xargs -I {} rustfmt {}"), "rustfmt {}");
+        assert_eq!(cmd_digest("env -S '-a -b' cargo build"), "cargo build");
+        assert_eq!(cmd_digest("sudo -p prompt cargo build"), "cargo build");
+        assert_eq!(cmd_digest("timeout -k 5 30 cargo test"), "cargo test");
+        assert_eq!(cmd_digest("stdbuf -o L cargo build"), "cargo build");
+        // Attached-value forms still work unchanged (single token, no
+        // separate-arg consumption needed).
+        assert_eq!(cmd_digest("stdbuf -oL cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_value_taking_flag_with_nothing_after_falls_back_gracefully() {
+        // `xargs -P` with no argument and no command: no panic, sensible
+        // fallback to the wrapper's own name.
+        assert_eq!(cmd_digest("xargs -P"), "xargs");
+        assert_eq!(cmd_digest("env -u"), "env");
+    }
+
+    #[test]
+    fn digest_skips_cd_export_set_to_next_segment() {
+        assert_eq!(cmd_digest("cd ai-obs && cargo test"), "cargo test");
+        assert_eq!(cmd_digest("cd ~/work/x && just verify"), "just verify");
+        assert_eq!(cmd_digest("cd x"), "cd x");
+        assert_eq!(cmd_digest("export FOO=1 && cargo build"), "cargo build");
+        assert_eq!(cmd_digest("set -e && cargo build"), "cargo build");
+        // No following segment: nothing to skip to, stays as-is.
+        assert_eq!(cmd_digest("export FOO=1"), "export FOO=1");
+    }
+
+    #[test]
+    fn digest_handles_nested_wrappers() {
+        assert_eq!(
+            cmd_digest(r#"nix-shell --run "sh -c 'cd ai-obs && cargo test'""#),
+            "cargo test"
+        );
+        assert_eq!(
+            cmd_digest("FOO=1 sudo -E nix-shell --run \"timeout 5 cargo build\""),
+            "cargo build"
+        );
+    }
+
+    #[test]
+    fn digest_handles_unbalanced_quotes_gracefully() {
+        // No closing quote: best-effort digest, must not panic.
+        let got = cmd_digest(r#"nix-shell --run "cargo"#);
+        assert!(
+            got == "cargo" || got == "nix-shell",
+            "expected a graceful fallback, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn digest_never_panics_on_adversarial_input() {
+        let cases = [
+            "",
+            "   ",
+            ";;;;&&&&||||",
+            "'''''''",
+            "\"\"\"\"\"\"\"",
+            "nix-shell --run",
+            "sh -c",
+            "sudo",
+            "timeout",
+            "cd",
+            "cd &&",
+            "🦀🚀 cargo test --日本語",
+            "FOO=1=2=3 cargo build",
+            "=cargo build",
+        ];
+        for c in cases {
+            let _ = cmd_digest(c);
+        }
+        // Deeply nested unwrap chain: must terminate (depth cap) not hang.
+        let nested = "sh -c 'sh -c \\'sh -c \\'\\'sh -c \\'\\'\\'cargo test\\'\\'\\'\\'\\'\\'";
+        let _ = cmd_digest(nested);
+        // 10KB single-line command: must not panic or hang.
+        let huge = format!("cargo test {}", "x".repeat(10_000));
+        let _ = cmd_digest(&huge);
+        // 10KB inside a nix-shell --run quote.
+        let huge_wrapped = format!(r#"nix-shell --run "cargo test {}""#, "y".repeat(10_000));
+        let _ = cmd_digest(&huge_wrapped);
+        // Multi-byte input right at the truncation boundary must not panic
+        // on a non-char-boundary slice.
+        let boundary = "€".repeat(30_000); // 3 bytes/char, crosses MAX_DIGEST_INPUT
+        let _ = cmd_digest(&boundary);
+    }
+
+    #[test]
+    fn digest_historical_rows_unaffected() {
+        // Privacy invariant: we only ever re-digest live commands as they're
+        // captured; nothing in the store re-derives cmd_digest from stored
+        // data, so old rows keep whatever digest they were written with even
+        // if a newer cmd_digest() would produce something different. This
+        // test exists as documentation, not as a behavioral check.
     }
 
     fn usage_with(cpu_user: u64, cpu_sys: u64, child_user: u64, child_sys: u64) -> ProcUsage {

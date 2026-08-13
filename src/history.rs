@@ -315,15 +315,43 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
     )?;
 
     // ---- heaviest ----
+    // `top_binary`: the dominant real binary (by summed cpu_ns, shells
+    // excluded) among each digest-group's spans' proc_stat children, via a
+    // single grouped join — not a per-row lookup. `scoped` narrows tool_span
+    // to the date/project window once; `bin_agg` sums proc_stat cpu per
+    // (tool,digest,binary) restricted to spans in that scope (proc_stat is
+    // small relative to llm_usage, see LEARNINGS.md); `ranked` picks the
+    // top binary per group via a window function; the outer query then
+    // LEFT JOINs `ranked` (rn=1 only, so at most one match per group) onto
+    // the per-group aggregate, so this is one pass over each table, no N+1.
     let heaviest = store.query_json(
-        "SELECT t.tool_name tool, COALESCE(t.cmd_digest,'') cmd, COUNT(*) calls,
-           COALESCE(SUM(COALESCE(t.cpu_ns,t.cpu_ns_sampled)),0)/1e9 cpu_s,
-           COALESCE(MAX(t.peak_footprint),0)/1e6 peak_mb,
-           COALESCE(SUM(t.leaked_count),0) leaked
-         FROM tool_span t JOIN session s ON s.id=t.session_id LEFT JOIN project p ON p.id=s.project_id
-         WHERE (?1 IS NULL OR p.name=?1)
-           AND date(t.started_at/1000,'unixepoch','localtime') BETWEEN ?2 AND ?3
-         GROUP BY t.tool_name, t.cmd_digest ORDER BY cpu_s DESC LIMIT 8",
+        "WITH scoped AS (
+           SELECT t.id, t.tool_name, t.cmd_digest, t.cpu_ns, t.cpu_ns_sampled,
+                  t.peak_footprint, t.leaked_count
+           FROM tool_span t JOIN session s ON s.id=t.session_id LEFT JOIN project p ON p.id=s.project_id
+           WHERE (?1 IS NULL OR p.name=?1)
+             AND date(t.started_at/1000,'unixepoch','localtime') BETWEEN ?2 AND ?3
+         ),
+         bin_agg AS (
+           SELECT sc.tool_name, sc.cmd_digest, ps.name,
+                  SUM(COALESCE(ps.cpu_user_ns,0)+COALESCE(ps.cpu_sys_ns,0)) cpu_ns
+           FROM proc_stat ps JOIN scoped sc ON sc.id = ps.span_id
+           WHERE ps.name NOT IN ('sh','bash','zsh','dash')
+           GROUP BY sc.tool_name, sc.cmd_digest, ps.name
+         ),
+         ranked AS (
+           SELECT tool_name, cmd_digest, name,
+                  ROW_NUMBER() OVER (PARTITION BY tool_name, cmd_digest ORDER BY cpu_ns DESC) rn
+           FROM bin_agg
+         )
+         SELECT sc.tool_name tool, COALESCE(sc.cmd_digest,'') cmd, COUNT(*) calls,
+           COALESCE(SUM(COALESCE(sc.cpu_ns,sc.cpu_ns_sampled)),0)/1e9 cpu_s,
+           COALESCE(MAX(sc.peak_footprint),0)/1e6 peak_mb,
+           COALESCE(SUM(sc.leaked_count),0) leaked,
+           MAX(r.name) top_binary
+         FROM scoped sc
+         LEFT JOIN ranked r ON r.tool_name = sc.tool_name AND r.cmd_digest IS sc.cmd_digest AND r.rn = 1
+         GROUP BY sc.tool_name, sc.cmd_digest ORDER BY cpu_s DESC LIMIT 8",
         &[
             &proj as &dyn ToSql,
             &b.cur_start as &dyn ToSql,
@@ -572,12 +600,25 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
         .first()
         .map(|r| i(r, "n"))
         .unwrap_or(0);
+    // `top_binary`: dominant real binary (by cpu_ns, shells excluded) among
+    // each span's own proc_stat children, joined once via a per-span ranked
+    // CTE rather than a per-row correlated subquery — a session has at most
+    // a few hundred spans, and proc_stat is scoped to just this session_id.
     let spans = store.query_json(
-        "SELECT tool_name tool, COALESCE(cmd_digest,'') cmd, agent_id agent_id, agent_type agent_type,
-           started_at started_at, ended_at ended_at,
-           COALESCE(cpu_ns,cpu_ns_sampled)/1e9 cpu_s, COALESCE(peak_footprint,0)/1e6 peak_mb,
-           ok ok, leaked_count leaked
-         FROM tool_span WHERE session_id=?1 ORDER BY started_at LIMIT 200",
+        "WITH ranked AS (
+           SELECT span_id, name,
+                  ROW_NUMBER() OVER (PARTITION BY span_id ORDER BY (COALESCE(cpu_user_ns,0)+COALESCE(cpu_sys_ns,0)) DESC) rn
+           FROM proc_stat
+           WHERE session_id=?1 AND name NOT IN ('sh','bash','zsh','dash')
+         )
+         SELECT t.tool_name tool, COALESCE(t.cmd_digest,'') cmd, t.agent_id agent_id, t.agent_type agent_type,
+           t.started_at started_at, t.ended_at ended_at,
+           COALESCE(t.cpu_ns,t.cpu_ns_sampled)/1e9 cpu_s, COALESCE(t.peak_footprint,0)/1e6 peak_mb,
+           t.ok ok, t.leaked_count leaked,
+           r.name top_binary
+         FROM tool_span t
+         LEFT JOIN ranked r ON r.span_id = t.id AND r.rn = 1
+         WHERE t.session_id=?1 ORDER BY t.started_at LIMIT 200",
         &[&id as &dyn ToSql],
     )?;
 
@@ -1054,6 +1095,146 @@ mod tests {
         assert_eq!(out["days"].as_array().unwrap().len(), 7);
         assert!(out["kpis"]["cost_usd"].as_f64().unwrap() > 0.0);
         assert_eq!(out["sessions"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn proc_row(pid: i32, comm: &str, cpu_user_ns: u64, cpu_sys_ns: u64) -> ProcRecord {
+        ProcRecord {
+            pid,
+            ppid: 1,
+            depth: 1,
+            comm: comm.to_string(),
+            name: comm.to_string(),
+            first_seen: 0,
+            last_seen: 1000,
+            exited: true,
+            cpu_user_ns,
+            cpu_sys_ns,
+            peak_footprint: 0,
+            disk_read: 0,
+            disk_write: 0,
+            attribution: "span",
+            orphaned: false,
+        }
+    }
+
+    /// Seeds a span with a shell (highest raw CPU, but excluded) plus two
+    /// real binaries so the dominant-binary aggregation has to both filter
+    /// shells and pick the actual max by summed cpu — not just "first row"
+    /// or "any non-shell row".
+    fn seed_span_with_procs(store: &Store, session_id: &str, tool_use_id: &str, now: i64) {
+        store
+            .write_span(
+                &SpanRecord {
+                    session_id: session_id.into(),
+                    tool_use_id: Some(tool_use_id.into()),
+                    agent_id: None,
+                    agent_type: None,
+                    tool_name: "Bash".into(),
+                    cmd_digest: Some("just verify".into()),
+                    started_at: now,
+                    ended_at: now + 1000,
+                    ok: Some(true),
+                    cpu_ns: Some(9_000_000_000),
+                    cpu_ns_sampled: 9_000_000_000,
+                    peak_footprint: 1 << 20,
+                    disk_read: 0,
+                    disk_write: 0,
+                    proc_count: 3,
+                    leaked_count: 0,
+                },
+                &[
+                    // Shell: highest raw cpu of any single row, must be excluded.
+                    proc_row(1, "zsh", 8_000_000_000, 0),
+                    // Dominant real binary: less than the shell alone, but the
+                    // biggest among non-shell rows.
+                    proc_row(2, "rustc", 3_000_000_000, 500_000_000),
+                    // A smaller real binary in the same span.
+                    proc_row(3, "cargo", 400_000_000, 100_000_000),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn heaviest_top_binary_excludes_shells_and_picks_dominant() {
+        let (dir, store) = scratch();
+        let pid = store.upsert_project("/tmp/proj-bin").unwrap();
+        let now = crate::store::now_ms();
+        store
+            .upsert_session("sbin", Some(pid), Some(1), Some("main"), Some("2.0"), now)
+            .unwrap();
+        seed_span_with_procs(&store, "sbin", "t1", now);
+
+        let out = build_history(&store, 7, None).unwrap();
+        let heaviest = out["heaviest"].as_array().unwrap();
+        let row = heaviest
+            .iter()
+            .find(|r| r["cmd"] == "just verify")
+            .expect("heaviest row for 'just verify' present");
+        assert_eq!(row["top_binary"], "rustc", "row: {row}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn heaviest_top_binary_absent_when_no_proc_stat() {
+        // Fast/transient spans with no sampled children just show the
+        // digest — top_binary must be null, not an error or a fabricated
+        // value.
+        let (dir, store) = scratch();
+        let pid = store.upsert_project("/tmp/proj-nobin").unwrap();
+        let now = crate::store::now_ms();
+        store
+            .upsert_session("snobin", Some(pid), Some(1), Some("main"), Some("2.0"), now)
+            .unwrap();
+        store
+            .write_span(
+                &SpanRecord {
+                    session_id: "snobin".into(),
+                    tool_use_id: Some("t1".into()),
+                    agent_id: None,
+                    agent_type: None,
+                    tool_name: "Bash".into(),
+                    cmd_digest: Some("echo hi".into()),
+                    started_at: now,
+                    ended_at: now + 10,
+                    ok: Some(true),
+                    cpu_ns: Some(1_000_000),
+                    cpu_ns_sampled: 1_000_000,
+                    peak_footprint: 0,
+                    disk_read: 0,
+                    disk_write: 0,
+                    proc_count: 0,
+                    leaked_count: 0,
+                },
+                &[],
+            )
+            .unwrap();
+        let out = build_history(&store, 7, None).unwrap();
+        let row = out["heaviest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["cmd"] == "echo hi")
+            .expect("heaviest row for 'echo hi' present");
+        assert!(row["top_binary"].is_null(), "row: {row}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_session_spans_include_top_binary() {
+        let (dir, store) = scratch();
+        let pid = store.upsert_project("/tmp/proj-sess-bin").unwrap();
+        let now = crate::store::now_ms();
+        store
+            .upsert_session("ssb", Some(pid), Some(1), Some("main"), Some("2.0"), now)
+            .unwrap();
+        seed_span_with_procs(&store, "ssb", "t1", now);
+
+        let out = build_session(&store, "ssb").unwrap().unwrap();
+        let spans = out["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["top_binary"], "rustc", "span: {}", spans[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
