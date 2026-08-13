@@ -175,8 +175,8 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
     let span_kpi_rows = store.query_json(
         "SELECT
            COALESCE(SUM(COALESCE(t.cpu_ns,t.cpu_ns_sampled)),0)/3.6e12 core_hours,
-           COALESCE(SUM(t.leaked_count),0) leaked_procs,
-           COALESCE(SUM(CASE WHEN t.leaked_count>0 THEN 1 ELSE 0 END),0) leaked_spans
+           COALESCE(SUM(t.orphaned_count),0) orphaned_procs,
+           COALESCE(SUM(CASE WHEN t.orphaned_count>0 THEN 1 ELSE 0 END),0) orphaned_spans
          FROM tool_span t JOIN session s ON s.id=t.session_id LEFT JOIN project p ON p.id=s.project_id
          WHERE (?1 IS NULL OR p.name=?1)
            AND date(t.started_at/1000,'unixepoch','localtime') BETWEEN ?2 AND ?3",
@@ -302,7 +302,7 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
         "SELECT p.name project, COUNT(*) calls,
            COALESCE(SUM(COALESCE(t.cpu_ns,t.cpu_ns_sampled)),0)/1e9 cpu_s,
            COALESCE(MAX(t.peak_footprint),0)/1e6 peak_mb,
-           COALESCE(SUM(t.leaked_count),0) leaked
+           COALESCE(SUM(t.orphaned_count),0) orphans
          FROM tool_span t JOIN session s ON s.id=t.session_id JOIN project p ON p.id=s.project_id
          WHERE (?1 IS NULL OR p.name=?1)
            AND date(t.started_at/1000,'unixepoch','localtime') BETWEEN ?2 AND ?3
@@ -327,7 +327,7 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
     let heaviest = store.query_json(
         "WITH scoped AS (
            SELECT t.id, t.tool_name, t.cmd_digest, t.cpu_ns, t.cpu_ns_sampled,
-                  t.peak_footprint, t.leaked_count
+                  t.peak_footprint, t.orphaned_count
            FROM tool_span t JOIN session s ON s.id=t.session_id LEFT JOIN project p ON p.id=s.project_id
            WHERE (?1 IS NULL OR p.name=?1)
              AND date(t.started_at/1000,'unixepoch','localtime') BETWEEN ?2 AND ?3
@@ -347,7 +347,7 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
          SELECT sc.tool_name tool, COALESCE(sc.cmd_digest,'') cmd, COUNT(*) calls,
            COALESCE(SUM(COALESCE(sc.cpu_ns,sc.cpu_ns_sampled)),0)/1e9 cpu_s,
            COALESCE(MAX(sc.peak_footprint),0)/1e6 peak_mb,
-           COALESCE(SUM(sc.leaked_count),0) leaked,
+           COALESCE(SUM(sc.orphaned_count),0) orphans,
            MAX(r.name) top_binary
          FROM scoped sc
          LEFT JOIN ranked r ON r.tool_name = sc.tool_name AND r.cmd_digest IS sc.cmd_digest AND r.rn = 1
@@ -402,14 +402,14 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
            s.git_branch branch, s.pr_number pr_number,
            COALESCE(ts.calls,0) calls, COALESCE(ts.cpu_s,0) cpu_s, COALESCE(ts.peak_mb,0) peak_mb,
            COALESCE(u.tokens_out,0) tokens_out, COALESCE(u.cost,0) cost, COALESCE(u.unpriced,0) unpriced,
-           s.end_reason end_reason, COALESCE(ts.leaked,0) leaked, COALESCE(ts.failed,0) failed,
+           s.end_reason end_reason, COALESCE(ts.orphans,0) orphans, COALESCE(ts.failed,0) failed,
            EXISTS(SELECT 1 FROM session_sample ss WHERE ss.session_id = s.id) has_samples,
            MAX(s.started_at, COALESCE(ts.last_span_ts,0), COALESCE(u.last_llm_ts,0)) last_activity_ms
          FROM session s
          LEFT JOIN project p ON p.id = s.project_id
          LEFT JOIN (
            SELECT session_id, COUNT(*) calls, SUM(COALESCE(cpu_ns,cpu_ns_sampled))/1e9 cpu_s,
-             MAX(peak_footprint)/1e6 peak_mb, SUM(leaked_count) leaked,
+             MAX(peak_footprint)/1e6 peak_mb, SUM(orphaned_count) orphans,
              SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) failed,
              MAX(COALESCE(ended_at,started_at)) last_span_ts
            FROM tool_span
@@ -468,8 +468,8 @@ pub fn build_history(store: &Store, days: i64, project: Option<&str>) -> Result<
             "tokens_out": cur_tokens_out,
             "cache_read": cur_cache_read,
             "unpriced_msgs": cur_unpriced,
-            "leaked_procs": i(span_k, "leaked_procs"),
-            "leaked_spans": i(span_k, "leaked_spans"),
+            "orphaned_procs": i(span_k, "orphaned_procs"),
+            "orphaned_spans": i(span_k, "orphaned_spans"),
             "findings_crit": i(finding_k, "findings_crit"),
             "findings_warn": i(finding_k, "findings_warn"),
             "finding_sessions": i(finding_k, "finding_sessions"),
@@ -614,7 +614,7 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
          SELECT t.tool_name tool, COALESCE(t.cmd_digest,'') cmd, t.agent_id agent_id, t.agent_type agent_type,
            t.started_at started_at, t.ended_at ended_at,
            COALESCE(t.cpu_ns,t.cpu_ns_sampled)/1e9 cpu_s, COALESCE(t.peak_footprint,0)/1e6 peak_mb,
-           t.ok ok, t.leaked_count leaked,
+           t.ok ok, t.orphaned_count orphans,
            r.name top_binary
          FROM tool_span t
          LEFT JOIN ranked r ON r.span_id = t.id AND r.rn = 1
@@ -963,7 +963,7 @@ mod tests {
                     disk_read: 0,
                     disk_write: 0,
                     proc_count: 1,
-                    leaked_count: 0,
+                    orphaned_count: 0,
                 },
                 &[],
             )
@@ -1053,7 +1053,7 @@ mod tests {
                     disk_read: 0,
                     disk_write: 0,
                     proc_count: 1,
-                    leaked_count: 0,
+                    orphaned_count: 0,
                 },
                 &[ProcRecord {
                     pid: 1,
@@ -1141,7 +1141,7 @@ mod tests {
                     disk_read: 0,
                     disk_write: 0,
                     proc_count: 3,
-                    leaked_count: 0,
+                    orphaned_count: 0,
                 },
                 &[
                     // Shell: highest raw cpu of any single row, must be excluded.
@@ -1205,7 +1205,7 @@ mod tests {
                     disk_read: 0,
                     disk_write: 0,
                     proc_count: 0,
-                    leaked_count: 0,
+                    orphaned_count: 0,
                 },
                 &[],
             )

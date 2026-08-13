@@ -688,7 +688,7 @@ fn build_agents(
                 "cpu_s": r.cpu_ns as f64 / 1e9,
                 "peak_mb": r.peak_footprint / 1_000_000,
                 "ok": r.ok,
-                "leaked_count": r.leaked_count,
+                "orphaned_count": r.orphaned_count,
                 "running": false,
                 "pid": Value::Null,
             }));
@@ -765,7 +765,7 @@ fn open_span_json(span: &Span, now: i64) -> Value {
         "cpu_s": cpu_ns_total as f64 / 1e9,
         "peak_mb": peak / 1_000_000,
         "ok": Value::Null,
-        "leaked_count": 0,
+        "orphaned_count": 0,
         "running": true,
         "pid": heaviest.map(|(pid, _)| pid),
     })

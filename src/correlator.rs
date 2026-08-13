@@ -581,7 +581,7 @@ impl Correlator {
     }
 
     /// Close the span matching tool_use_id (or the oldest open span when the
-    /// id is missing/unknown) and persist it. Returns leaked pids.
+    /// id is missing/unknown) and persist it. Returns orphaned pids.
     pub fn close_span(
         &mut self,
         store: &Arc<Store>,
@@ -669,8 +669,8 @@ impl Correlator {
             _ => None,
         };
 
-        // Final usage read for procs still alive; classify leaks.
-        let mut leaked = 0u32;
+        // Final usage read for procs still alive; classify orphans.
+        let mut orphaned = 0u32;
         let mut peak = 0u64;
         let mut sampled_ns = 0u64;
         let mut disk_r = 0u64;
@@ -696,7 +696,7 @@ impl Correlator {
                 .iter()
                 .any(|a| agg.info.comm.starts_with(a));
             if alive && !is_allowed {
-                leaked += 1;
+                orphaned += 1;
             }
             rows.push(ProcRecord {
                 pid: *pid,
@@ -733,7 +733,7 @@ impl Correlator {
             disk_read: disk_r,
             disk_write: disk_w,
             proc_count: span.procs.len() as u32,
-            leaked_count: leaked,
+            orphaned_count: orphaned,
         };
         match store.write_span(&record, &rows) {
             Ok(span_id) => {

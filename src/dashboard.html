@@ -189,7 +189,7 @@
         <span style="width:46px" class="col-r">CALLS</span>
         <span style="width:50px" class="col-r">CPU S</span>
         <span style="width:56px" class="col-r">PEAK</span>
-        <span style="width:38px" class="col-r">LEAK</span>
+        <span style="width:38px" class="col-r">ORPHANS</span>
       </div>
       <div id="byResource"></div>
       <div class="hr"></div>
@@ -530,9 +530,9 @@
         <div class="kpi-note">${fmtCompact(k.cache_read)} read from cache</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">LEAKED PROCS</div>
-        <div class="kpi-val mono">${fmtCompact(k.leaked_procs)}</div>
-        <div class="kpi-note">across ${k.leaked_spans} tool calls</div>
+        <div class="kpi-label">ORPHANED PROCS</div>
+        <div class="kpi-val mono">${fmtCompact(k.orphaned_procs)}</div>
+        <div class="kpi-note">across ${k.orphaned_spans} tool calls</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">FINDINGS</div>
@@ -617,7 +617,7 @@
         <span style="width:46px;color:var(--text-dim)" class="col-r">${p.calls}</span>
         <span style="width:50px;color:var(--text-mid)" class="col-r">${p.cpu_s.toFixed(1)}</span>
         <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtMem(p.peak_mb)}</span>
-        <span style="width:38px;color:${p.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${p.leaked}</span>
+        <span style="width:38px;color:${p.orphans > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${p.orphans}</span>
       </div>
     `).join('') || emptyNote('no resource data');
 
@@ -628,7 +628,7 @@
         <span style="width:46px;color:var(--text-dim2)" class="col-r">${h.calls}</span>
         <span style="width:50px;color:var(--text-mid)" class="col-r">${h.cpu_s.toFixed(1)}</span>
         <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtMem(h.peak_mb)}</span>
-        <span style="width:38px;color:${h.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${h.leaked}</span>
+        <span style="width:38px;color:${h.orphans > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${h.orphans}</span>
       </div>
     `).join('') || emptyNote('no tool calls in range');
 
@@ -663,7 +663,7 @@
 
   function filteredSortedSessions() {
     let rows = (historyData.sessions || []).slice();
-    if (state.onlyFindings) rows = rows.filter((s) => s.leaked > 0);
+    if (state.onlyFindings) rows = rows.filter((s) => s.orphans > 0);
     if (state.onlyFailed) rows = rows.filter((s) => s.failed > 0);
     const cmp = {
       recent: (a, b) => b.started_at - a.started_at,
@@ -684,9 +684,9 @@
       return;
     }
     body.innerHTML = rows.map((s) => {
-      const mark = s.leaked > 0 ? 'var(--red)' : (s.failed > 0 ? 'var(--text-dim)' : 'transparent');
-      const flag = s.leaked > 0 ? `${s.leaked} leaked` : (s.failed > 0 ? `${s.failed} failed` : '');
-      const flagColor = s.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
+      const mark = s.orphans > 0 ? 'var(--red)' : (s.failed > 0 ? 'var(--text-dim)' : 'transparent');
+      const flag = s.orphans > 0 ? `${s.orphans} orphaned` : (s.failed > 0 ? `${s.failed} failed` : '');
+      const flagColor = s.orphans > 0 ? 'var(--red)' : 'var(--text-dim2)';
       // `status` is server-derived (history.rs `derive_status`): the raw
       // end_reason when the session actually ended, else "running" (recent
       // activity within the last 10 min) or "inactive" (end_reason was
@@ -887,10 +887,10 @@
     const left = Math.max(0, Math.min(100, ((g.started_at - sessionStart) / durMs) * 100));
     const width = Math.max(0.3, Math.min(100 - left, (((g.ended_at || sessionStart + durMs) - g.started_at) / durMs) * 100));
     const failed = g.ok === false;
-    const color = failed ? 'var(--red)' : (g.leaked > 0 ? 'var(--red)' : 'var(--text-mid)');
+    const color = failed ? 'var(--red)' : (g.orphans > 0 ? 'var(--red)' : 'var(--text-mid)');
     const labelColor = failed ? 'var(--red)' : 'var(--text-dim)';
-    const note = failed ? 'failed' : (g.leaked > 0 ? `${g.leaked} leaked` : '');
-    const noteColor = failed || g.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
+    const note = failed ? 'failed' : (g.orphans > 0 ? `${g.orphans} orphaned` : '');
+    const noteColor = failed || g.orphans > 0 ? 'var(--red)' : 'var(--text-dim2)';
     const label = (g.cmd ? `${g.tool} · ${g.cmd}` : g.tool) + binarySuffixPlain(g.cmd, g.top_binary);
     return `
       <div class="gantt-row${nested ? ' nested' : ''}">
