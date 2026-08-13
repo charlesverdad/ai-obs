@@ -23,19 +23,43 @@ fn fetch() -> Result<serde_json::Value> {
     crate::client::get_json(port(), "/api/top")
 }
 
+/// Compact human-readable count: `1.2M`, `48k`, `321`. Shared with `report`.
+pub fn fmt_compact(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Cost as `$12.34`, with a trailing `+` when some rows had no known price.
+fn fmt_cost(cost_usd: f64, unpriced: i64) -> String {
+    let suffix = if unpriced > 0 { "+" } else { "" };
+    format!("${cost_usd:.2}{suffix}")
+}
+
 fn print_once() -> Result<()> {
     let v = fetch()?;
     println!(
-        "{:<24} {:>7} {:>9} {:>6}  CURRENT",
-        "PROJECT", "CPU%", "MEM MB", "PROCS"
+        "{:<24} {:>7} {:>9} {:>6} {:>8} {:>8} {:>9}  CURRENT",
+        "PROJECT", "CPU%", "MEM MB", "PROCS", "TOK IN", "TOK OUT", "COST"
     );
     for s in v["sessions"].as_array().unwrap_or(&vec![]) {
+        let tok_in = s["tokens_in"].as_i64().unwrap_or(0);
+        let tok_out = s["tokens_out"].as_i64().unwrap_or(0);
+        let cost = s["cost_usd"].as_f64().unwrap_or(0.0);
+        let unpriced = s["unpriced"].as_i64().unwrap_or(0);
         println!(
-            "{:<24} {:>7} {:>9} {:>6}  {}",
+            "{:<24} {:>7} {:>9} {:>6} {:>8} {:>8} {:>9}  {}",
             s["project"].as_str().unwrap_or("?"),
             s["cpu_pct"],
             s["footprint_mb"],
             s["procs"],
+            fmt_compact(tok_in),
+            fmt_compact(tok_out),
+            fmt_cost(cost, unpriced),
             s["current_tool"].as_str().unwrap_or("idle")
         );
     }
@@ -74,6 +98,9 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 "MEM MB",
                 "PROCS",
                 "SPANS",
+                "TOK IN",
+                "TOK OUT",
+                "COST",
                 "CURRENT TOOL",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD));
@@ -90,12 +117,19 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     } else {
                         Style::default()
                     };
+                    let tok_in = s["tokens_in"].as_i64().unwrap_or(0);
+                    let tok_out = s["tokens_out"].as_i64().unwrap_or(0);
+                    let cost = s["cost_usd"].as_f64().unwrap_or(0.0);
+                    let unpriced = s["unpriced"].as_i64().unwrap_or(0);
                     Row::new(vec![
                         s["project"].as_str().unwrap_or("?").to_string(),
                         format!("{cpu:.1}"),
                         s["footprint_mb"].to_string(),
                         s["procs"].to_string(),
                         s["open_spans"].to_string(),
+                        fmt_compact(tok_in),
+                        fmt_compact(tok_out),
+                        fmt_cost(cost, unpriced),
                         s["current_tool"].as_str().unwrap_or("idle").to_string(),
                     ])
                     .style(style)
@@ -104,12 +138,15 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             let table = Table::new(
                 rows,
                 [
-                    Constraint::Length(24),
+                    Constraint::Length(20),
+                    Constraint::Length(6),
                     Constraint::Length(8),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(7),
+                    Constraint::Length(7),
                     Constraint::Length(9),
-                    Constraint::Length(6),
-                    Constraint::Length(6),
-                    Constraint::Min(20),
+                    Constraint::Min(15),
                 ],
             )
             .header(header)

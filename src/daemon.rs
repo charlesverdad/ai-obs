@@ -1,15 +1,19 @@
 //! The ai-obs daemon: HTTP hook endpoint + adaptive sampler + detectors.
 
 use crate::correlator::{snapshot_map, Correlator};
-use crate::store::{now_ms, Store};
+use crate::store::{now_ms, Store, TokenTotals};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT: u16 = 8770;
+
+/// Timestamped, refcounted snapshot of `session_token_totals()`.
+type TokenTotalsCache = Arc<Mutex<Option<(Instant, Arc<HashMap<String, TokenTotals>>)>>>;
 
 /// (kind, severity, session_id, span_id, pid, message)
 type Finding = (
@@ -35,6 +39,10 @@ pub struct AppState {
     pub started_at: i64,
     /// Rolling sampler self-cost, ns per second of wall time.
     pub sampler_cost: Arc<Mutex<f64>>,
+    /// Cached `session_token_totals()` result, refreshed at most every ~2s —
+    /// the tailer only updates llm_usage every 3s so this saves repeated
+    /// full-table scans on rapid /api/top polling.
+    pub token_totals_cache: TokenTotalsCache,
 }
 
 pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
@@ -45,6 +53,7 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         corr: corr.clone(),
         started_at: now_ms(),
         sampler_cost: Arc::new(Mutex::new(0.0)),
+        token_totals_cache: Arc::new(Mutex::new(None)),
     };
 
     // Sampler loop (blocking-ish work on a dedicated thread-friendly task).
@@ -373,7 +382,26 @@ async fn api_status(State(st): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Fetch per-session token totals, using a short-lived cache since the
+/// tailer only writes to llm_usage every ~3s.
+fn token_totals(st: &AppState) -> Arc<HashMap<String, TokenTotals>> {
+    const TTL: Duration = Duration::from_secs(2);
+    {
+        let cache = st.token_totals_cache.lock().unwrap();
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return map.clone();
+            }
+        }
+    }
+    let map = Arc::new(st.store.session_token_totals().unwrap_or_default());
+    *st.token_totals_cache.lock().unwrap() = Some((Instant::now(), map.clone()));
+    map
+}
+
 async fn api_top(State(st): State<AppState>) -> Json<Value> {
+    // Query the store outside the correlator lock.
+    let totals = token_totals(&st);
     let sessions: Vec<Value> = {
         let corr = st.corr.lock().unwrap();
         let mut rows: Vec<_> = corr.sessions.values().collect();
@@ -384,6 +412,14 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
         });
         rows.iter()
             .map(|s| {
+                let t = totals.get(&s.id);
+                let tokens_in = t.map(|t| t.input_tokens).unwrap_or(0);
+                let tokens_out = t.map(|t| t.output_tokens).unwrap_or(0);
+                let cache_read = t.map(|t| t.cache_read).unwrap_or(0);
+                let cost_usd = t
+                    .map(|t| (t.cost_usd * 100.0).round() / 100.0)
+                    .unwrap_or(0.0);
+                let unpriced = t.map(|t| t.unpriced).unwrap_or(0);
                 json!({
                     "session_id": s.id,
                     "project": s.project_root.as_deref()
@@ -395,6 +431,11 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                     "procs": s.proc_count,
                     "current_tool": s.current_tool,
                     "open_spans": s.open_spans.len(),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cache_read": cache_read,
+                    "cost_usd": cost_usd,
+                    "unpriced": unpriced,
                 })
             })
             .collect()

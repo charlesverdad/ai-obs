@@ -111,16 +111,7 @@ pub fn run(opts: &ReportOpts) -> Result<()> {
 }
 
 fn print_markdown(v: &Value) {
-    let fmt_tokens = |n: &Value| -> String {
-        let n = n.as_i64().unwrap_or(0);
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1e6)
-        } else if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1e3)
-        } else {
-            n.to_string()
-        }
-    };
+    let fmt_tokens = |n: &Value| -> String { crate::top::fmt_compact(n.as_i64().unwrap_or(0)) };
 
     println!("## Spend by project\n");
     println!("| project | sessions | input | output | cache read | cache write | cost USD |");

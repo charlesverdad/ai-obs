@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -55,6 +56,19 @@ pub struct ProcRecord {
     pub disk_write: u64,
     pub attribution: &'static str,
     pub orphaned: bool,
+}
+
+/// Per-session token/cost rollup from `llm_usage`.
+#[derive(Debug, Clone, Default)]
+pub struct TokenTotals {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read: i64,
+    #[allow(dead_code)] // queried for completeness; not yet surfaced by any consumer
+    pub cache_creation: i64,
+    pub cost_usd: f64,
+    /// Count of rows with a NULL cost_usd (i.e. cost unknown/unpriced).
+    pub unpriced: i64,
 }
 
 pub struct LlmUsageRecord {
@@ -335,6 +349,42 @@ impl Store {
             ],
         )?;
         Ok(n > 0)
+    }
+
+    /// Per-session token/cost totals from `llm_usage`, grouped by session_id.
+    /// Sessions with no llm_usage rows simply won't appear in the result map.
+    pub fn session_token_totals(&self) -> Result<HashMap<String, TokenTotals>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id,
+                COALESCE(SUM(input_tokens),0),
+                COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read),0),
+                COALESCE(SUM(cache_creation),0),
+                COALESCE(SUM(COALESCE(cost_usd,0)),0),
+                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+             FROM llm_usage
+             GROUP BY session_id",
+        )?;
+        let mut out = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                TokenTotals {
+                    input_tokens: r.get(1)?,
+                    output_tokens: r.get(2)?,
+                    cache_read: r.get(3)?,
+                    cache_creation: r.get(4)?,
+                    cost_usd: r.get(5)?,
+                    unpriced: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (sid, totals) = row?;
+            out.insert(sid, totals);
+        }
+        Ok(out)
     }
 
     pub fn checkpoint(&self, path: &str) -> Result<u64> {
