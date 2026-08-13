@@ -13,7 +13,11 @@ mod top;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ai-obs", version, about = "Local-first observability for AI coding agents")]
+#[command(
+    name = "ai-obs",
+    version,
+    about = "Local-first observability for AI coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

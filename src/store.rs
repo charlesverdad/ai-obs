@@ -171,10 +171,7 @@ impl Store {
     }
 
     pub fn open_readonly(path: &Path) -> Result<Store> {
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -383,9 +380,8 @@ impl Store {
     /// Recent findings, newest first.
     pub fn recent_findings(&self, limit: u32) -> Result<Vec<(i64, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT ts, kind, severity, message FROM finding ORDER BY ts DESC LIMIT ?1",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT ts, kind, severity, message FROM finding ORDER BY ts DESC LIMIT ?1")?;
         let rows = stmt
             .query_map([limit], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -395,7 +391,11 @@ impl Store {
     }
 
     /// Run an arbitrary read query returning JSON rows — used by report.
-    pub fn query_json(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<serde_json::Value>> {
+    pub fn query_json(
+        &self,
+        sql: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(sql)?;
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -439,8 +439,15 @@ mod tests {
         let db = dir.join("t.db");
         let s = Store::open(&db).unwrap();
         let pid = s.upsert_project("/tmp/proj").unwrap();
-        s.upsert_session("sess1", Some(pid), Some(123), Some("main"), Some("2.1.0"), 1000)
-            .unwrap();
+        s.upsert_session(
+            "sess1",
+            Some(pid),
+            Some(123),
+            Some("main"),
+            Some("2.1.0"),
+            1000,
+        )
+        .unwrap();
         let span_id = s
             .write_span(
                 &SpanRecord {

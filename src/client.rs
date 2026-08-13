@@ -2,6 +2,7 @@
 //! for what is only ever "POST small JSON to 127.0.0.1".
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -21,11 +22,8 @@ fn request(
     body: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        Duration::from_millis(800),
-    )
-    .with_context(|| format!("daemon not reachable on {addr}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(800))
+        .with_context(|| format!("daemon not reachable on {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_millis(2500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2500)))?;
 
@@ -58,5 +56,3 @@ fn request(
     let v = serde_json::Value::deserialize(&mut de)?;
     Ok(v)
 }
-
-use serde::Deserialize;

@@ -24,7 +24,10 @@ pub fn run() -> i32 {
         if procs.len() < 10 {
             Err(format!("only {} processes visible", procs.len()))
         } else if dt.as_millis() > 50 {
-            Err(format!("{} procs in {dt:?} — too slow for 10 Hz", procs.len()))
+            Err(format!(
+                "{} procs in {dt:?} — too slow for 10 Hz",
+                procs.len()
+            ))
         } else {
             Ok(format!("{} procs in {dt:?}", procs.len()))
         }
@@ -79,7 +82,10 @@ pub fn run() -> i32 {
                 Err(e) => Err(format!("cannot open {}: {e:#}", db.display())),
             }
         } else {
-            Err(format!("{} does not exist yet (daemon not run?)", db.display()))
+            Err(format!(
+                "{} does not exist yet (daemon not run?)",
+                db.display()
+            ))
         }
     });
 

@@ -59,6 +59,7 @@ pub struct Session {
     pub project_root: Option<String>,
     pub project_id: Option<i64>,
     pub claude_pid: Option<i32>,
+    #[allow(dead_code)]
     pub git_branch: Option<String>,
     pub started_at: i64,
     /// PIDs ever seen in this session's tree that are still live (or not yet
@@ -93,6 +94,17 @@ pub struct OrphanWatch {
 #[derive(Default)]
 pub struct Correlator {
     pub sessions: HashMap<String, Session>,
+}
+
+pub struct OpenSpanArgs<'a> {
+    pub session_id: &'a str,
+    pub cwd: Option<&'a str>,
+    pub tool_use_id: Option<String>,
+    pub tool_name: String,
+    pub command: Option<&'a str>,
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub procs: &'a HashMap<i32, ProcInfo>,
 }
 
 fn now_ms() -> i64 {
@@ -163,17 +175,17 @@ impl Correlator {
         sess
     }
 
-    pub fn open_span(
-        &mut self,
-        session_id: &str,
-        cwd: Option<&str>,
-        tool_use_id: Option<String>,
-        tool_name: String,
-        command: Option<&str>,
-        agent_id: Option<String>,
-        agent_type: Option<String>,
-        procs: &HashMap<i32, ProcInfo>,
-    ) {
+    pub fn open_span(&mut self, args: OpenSpanArgs<'_>) {
+        let OpenSpanArgs {
+            session_id,
+            cwd,
+            tool_use_id,
+            tool_name,
+            command,
+            agent_id,
+            agent_type,
+            procs,
+        } = args;
         let sess = self.ensure_session(session_id, cwd, None);
         let shell_base = shell_child_ns(sess.claude_pid, procs);
         let already_open = !sess.open_spans.is_empty();
@@ -218,7 +230,11 @@ impl Correlator {
                 .open_spans
                 .iter()
                 .position(|s| s.tool_use_id.as_deref() == Some(id))
-                .or(if sess.open_spans.is_empty() { None } else { Some(0) }),
+                .or(if sess.open_spans.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }),
             None => {
                 if sess.open_spans.is_empty() {
                     None
@@ -229,14 +245,14 @@ impl Correlator {
         };
         let Some(idx) = idx else { return };
         let mut span = sess.open_spans.remove(idx);
-        sess.current_tool = sess
-            .open_spans
-            .last()
-            .map(|s| s.tool_name.clone());
+        sess.current_tool = sess.open_spans.last().map(|s| s.tool_name.clone());
         let ended_at = now_ms();
 
         // Exact CPU: shell child-CPU delta across the span.
-        let cpu_ns = match (span.shell_child_base_ns, shell_child_ns(sess.claude_pid, procs)) {
+        let cpu_ns = match (
+            span.shell_child_base_ns,
+            shell_child_ns(sess.claude_pid, procs),
+        ) {
             (Some(base), Some(now)) => Some(now.saturating_sub(base)),
             _ => None,
         };
@@ -264,7 +280,9 @@ impl Correlator {
             peak = peak.max(agg.peak_footprint);
             disk_r += u.disk_read;
             disk_w += u.disk_write;
-            let is_allowed = ORPHAN_ALLOWLIST.iter().any(|a| agg.info.comm.starts_with(a));
+            let is_allowed = ORPHAN_ALLOWLIST
+                .iter()
+                .any(|a| agg.info.comm.starts_with(a));
             if alive && !is_allowed {
                 leaked += 1;
             }
@@ -309,7 +327,9 @@ impl Correlator {
             Ok(span_id) => {
                 for (pid, agg) in span.procs.iter() {
                     if procs.contains_key(pid)
-                        && !ORPHAN_ALLOWLIST.iter().any(|a| agg.info.comm.starts_with(a))
+                        && !ORPHAN_ALLOWLIST
+                            .iter()
+                            .any(|a| agg.info.comm.starts_with(a))
                     {
                         sess.orphan_watch.push(OrphanWatch {
                             span_id,
@@ -372,7 +392,9 @@ impl Correlator {
             }
 
             for pid in tracked {
-                let Some(info) = procs.get(&pid) else { continue };
+                let Some(info) = procs.get(&pid) else {
+                    continue;
+                };
                 let Some(u) = mac::usage(pid) else { continue };
                 total_cpu_ns += u.cpu_user_ns + u.cpu_sys_ns;
                 total_footprint += u.phys_footprint;
@@ -509,7 +531,10 @@ mod tests {
     #[test]
     fn digest_strips_paths_and_flags() {
         assert_eq!(cmd_digest("cargo test --all"), "cargo test");
-        assert_eq!(cmd_digest("/usr/bin/python3 /tmp/x.py --flag"), "python3 x.py");
+        assert_eq!(
+            cmd_digest("/usr/bin/python3 /tmp/x.py --flag"),
+            "python3 x.py"
+        );
         assert_eq!(cmd_digest("FOO=1 just verify"), "just verify");
         assert_eq!(cmd_digest("ls -la"), "ls");
         assert_eq!(cmd_digest(""), "sh");

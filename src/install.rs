@@ -203,10 +203,19 @@ mod tests {
         let exe = "ai-obs";
         // Simulate the merge body (install() reads from disk; test the logic inline).
         let hooks = root.as_object_mut().unwrap().get_mut("hooks").unwrap();
-        let arr = hooks.as_object_mut().unwrap().get_mut("PreToolUse").unwrap().as_array_mut().unwrap();
+        let arr = hooks
+            .as_object_mut()
+            .unwrap()
+            .get_mut("PreToolUse")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
         let ours = http_hook(8770, "pre");
         let exists = arr.iter().any(|g| {
-            g["hooks"].as_array().map(|hs| hs.iter().any(|h| is_ours(h, exe))).unwrap_or(false)
+            g["hooks"]
+                .as_array()
+                .map(|hs| hs.iter().any(|h| is_ours(h, exe)))
+                .unwrap_or(false)
         });
         assert!(!exists);
         arr.push(json!({"matcher": "*", "hooks": [ours]}));
@@ -215,7 +224,10 @@ mod tests {
         assert_eq!(arr.len(), 2);
         // second pass detects ours
         let exists = arr.iter().any(|g| {
-            g["hooks"].as_array().map(|hs| hs.iter().any(|h| is_ours(h, exe))).unwrap_or(false)
+            g["hooks"]
+                .as_array()
+                .map(|hs| hs.iter().any(|h| is_ours(h, exe)))
+                .unwrap_or(false)
         });
         assert!(exists);
     }

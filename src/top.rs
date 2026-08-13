@@ -26,8 +26,8 @@ fn fetch() -> Result<serde_json::Value> {
 fn print_once() -> Result<()> {
     let v = fetch()?;
     println!(
-        "{:<24} {:>7} {:>9} {:>6}  {}",
-        "PROJECT", "CPU%", "MEM MB", "PROCS", "CURRENT"
+        "{:<24} {:>7} {:>9} {:>6}  CURRENT",
+        "PROJECT", "CPU%", "MEM MB", "PROCS"
     );
     for s in v["sessions"].as_array().unwrap_or(&vec![]) {
         println!(
@@ -51,15 +51,15 @@ fn print_once() -> Result<()> {
 
 fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut last = serde_json::json!({"sessions": [], "findings": []});
-    let mut err: Option<String> = None;
+    let mut err: Option<String>;
     loop {
-        match fetch() {
+        err = match fetch() {
             Ok(v) => {
                 last = v;
-                err = None;
+                None
             }
-            Err(e) => err = Some(format!("{e:#}")),
-        }
+            Err(e) => Some(format!("{e:#}")),
+        };
         terminal.draw(|f| {
             let chunks = Layout::vertical([
                 Constraint::Min(5),
@@ -68,8 +68,15 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             ])
             .split(f.area());
 
-            let header = Row::new(vec!["PROJECT", "CPU%", "MEM MB", "PROCS", "SPANS", "CURRENT TOOL"])
-                .style(Style::default().add_modifier(Modifier::BOLD));
+            let header = Row::new(vec![
+                "PROJECT",
+                "CPU%",
+                "MEM MB",
+                "PROCS",
+                "SPANS",
+                "CURRENT TOOL",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD));
             let rows: Vec<Row> = last["sessions"]
                 .as_array()
                 .unwrap_or(&vec![])
@@ -106,7 +113,11 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 ],
             )
             .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" ai-obs — live sessions "));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ai-obs — live sessions "),
+            );
             f.render_widget(table, chunks[0]);
 
             let findings: Vec<Line> = last["findings"]
@@ -115,7 +126,11 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 .iter()
                 .map(|x| {
                     let sev = x["severity"].as_str().unwrap_or("");
-                    let color = if sev == "crit" { Color::Red } else { Color::Yellow };
+                    let color = if sev == "crit" {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    };
                     Line::styled(
                         format!(
                             "[{}] {}",

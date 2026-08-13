@@ -40,7 +40,9 @@ pub fn scan_once(store: &Store, root: &Path) -> usize {
     let mut new_rows = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             let Ok(ft) = e.file_type() else { continue };
@@ -141,9 +143,15 @@ fn ingest_record(store: &Store, v: &Value) -> anyhow::Result<bool> {
             if sid.is_empty() {
                 return Ok(false);
             }
-            let Some(msg) = v.get("message") else { return Ok(false) };
-            let Some(usage) = msg.get("usage") else { return Ok(false) };
-            let Some(uuid) = get_str(v, "uuid") else { return Ok(false) };
+            let Some(msg) = v.get("message") else {
+                return Ok(false);
+            };
+            let Some(usage) = msg.get("usage") else {
+                return Ok(false);
+            };
+            let Some(uuid) = get_str(v, "uuid") else {
+                return Ok(false);
+            };
             let model = msg
                 .get("model")
                 .and_then(|x| x.as_str())
@@ -173,7 +181,11 @@ fn ingest_record(store: &Store, v: &Value) -> anyhow::Result<bool> {
                 cache_read: cr,
                 cache_creation: cc,
                 cost_usd: cost,
-                cost_source: if cost.is_some() { "computed" } else { "unknown" },
+                cost_source: if cost.is_some() {
+                    "computed"
+                } else {
+                    "unknown"
+                },
             };
             Ok(store.insert_llm_usage(&rec)?)
         }
@@ -219,7 +231,10 @@ mod tests {
     fn ts_parse() {
         // cross-checked with `date -u -j -f ...` / python datetime
         assert_eq!(rfc3339_to_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(rfc3339_to_ms("2026-06-13T01:40:57.084Z"), Some(1781401257084));
+        assert_eq!(
+            rfc3339_to_ms("2026-06-13T01:40:57.084Z"),
+            Some(1781314857084)
+        );
         assert_eq!(rfc3339_to_ms("garbage"), None);
     }
 
@@ -261,7 +276,10 @@ mod tests {
             "message": {"model": "claude-fable-5", "usage": {"input_tokens": 5, "output_tokens": 5}}
         });
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&jsonl).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl)
+            .unwrap();
         writeln!(f, "{rec2}").unwrap();
         let n = scan_once(&store, &dir.join("projects"));
         assert_eq!(n, 1);

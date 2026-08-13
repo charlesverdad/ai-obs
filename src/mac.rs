@@ -145,7 +145,9 @@ pub struct ProcUsage {
     pub lifetime_max_footprint: u64,
     pub disk_read: u64,
     pub disk_write: u64,
+    #[allow(dead_code)]
     pub instructions: u64,
+    #[allow(dead_code)]
     pub cycles: u64,
 }
 
@@ -187,7 +189,15 @@ pub fn list_processes() -> Vec<ProcInfo> {
         let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<ProcBsdInfo>() as i32;
         // SAFETY: buffer matches the flavor's struct size.
-        let n = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+        let n = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut c_void,
+                size,
+            )
+        };
         if n < size {
             continue; // exited mid-scan or not permitted
         }
@@ -247,8 +257,7 @@ pub fn timebase_self_check() -> Result<(), String> {
     if rc != 0 {
         return Err("getrusage failed".into());
     }
-    let ref_ns = (ru.ru_utime.tv_sec as u64 * 1_000_000_000
-        + ru.ru_utime.tv_usec as u64 * 1_000)
+    let ref_ns = (ru.ru_utime.tv_sec as u64 * 1_000_000_000 + ru.ru_utime.tv_usec as u64 * 1_000)
         + (ru.ru_stime.tv_sec as u64 * 1_000_000_000 + ru.ru_stime.tv_usec as u64 * 1_000);
 
     let ratio = mine_ns as f64 / ref_ns.max(1) as f64;
@@ -301,9 +310,8 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let after = usage(std::process::id() as i32).unwrap();
-        let delta =
-            (after.child_cpu_user_ns + after.child_cpu_sys_ns)
-                .saturating_sub(before.child_cpu_user_ns + before.child_cpu_sys_ns);
+        let delta = (after.child_cpu_user_ns + after.child_cpu_sys_ns)
+            .saturating_sub(before.child_cpu_user_ns + before.child_cpu_sys_ns);
         assert!(
             delta > 20_000_000,
             "child CPU delta {delta} ns implausibly small — reaped-child accounting broken"

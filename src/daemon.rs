@@ -11,6 +11,16 @@ use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 8770;
 
+/// (kind, severity, session_id, span_id, pid, message)
+type Finding = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i32>,
+    String,
+);
+
 pub fn port() -> u16 {
     std::env::var("AI_OBS_PORT")
         .ok()
@@ -65,7 +75,10 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
 
     let addr = format!("127.0.0.1:{}", port());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("ai-obs daemon listening on {addr}, db {}", db_path.display());
+    tracing::info!(
+        "ai-obs daemon listening on {addr}, db {}",
+        db_path.display()
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -95,7 +108,9 @@ async fn sampler_loop(state: AppState) {
                     .collect()
             };
             for (sid, cpu, fp, n) in rows {
-                let _ = state.store.insert_session_sample(&sid, now / 1000, cpu, fp, n);
+                let _ = state
+                    .store
+                    .insert_session_sample(&sid, now / 1000, cpu, fp, n);
             }
         }
         let cost_ns = t0.elapsed().as_nanos() as f64;
@@ -118,8 +133,7 @@ async fn detector_loop(state: AppState) {
         let procs = tokio::task::spawn_blocking(snapshot_map)
             .await
             .unwrap_or_default();
-        let mut findings: Vec<(String, String, Option<String>, Option<i64>, Option<i32>, String)> =
-            Vec::new();
+        let mut findings: Vec<Finding> = Vec::new();
         {
             let mut corr = state.corr.lock().unwrap();
             let ncores = std::thread::available_parallelism()
@@ -162,7 +176,8 @@ async fn detector_loop(state: AppState) {
                         ));
                     }
                 }
-                sess.orphan_watch.retain(|w| !w.reported || procs.contains_key(&w.pid));
+                sess.orphan_watch
+                    .retain(|w| !w.reported || procs.contains_key(&w.pid));
 
                 // Leak: sustained growth, footprint > 2 GB and cpu evidence over 10 min
                 // is done from session_sample by the reporter; here a cheap live check.
@@ -217,7 +232,10 @@ async fn h_session_start(State(st): State<AppState>, Json(v): Json<Value>) -> Js
         return Json(json!({}));
     };
     let cwd = s(&v, "cwd");
-    let claude_pid = v.get("claude_pid").and_then(|x| x.as_i64()).map(|x| x as i32);
+    let claude_pid = v
+        .get("claude_pid")
+        .and_then(|x| x.as_i64())
+        .map(|x| x as i32);
     {
         let mut corr = st.corr.lock().unwrap();
         let sess = corr.ensure_session(&sid, cwd.as_deref(), claude_pid);
@@ -225,7 +243,9 @@ async fn h_session_start(State(st): State<AppState>, Json(v): Json<Value>) -> Js
             sess.claude_pid = claude_pid;
         }
         let root = sess.project_root.clone();
-        let project_id = root.as_deref().and_then(|r| st.store.upsert_project(r).ok());
+        let project_id = root
+            .as_deref()
+            .and_then(|r| st.store.upsert_project(r).ok());
         sess.project_id = project_id;
         let _ = st.store.upsert_session(
             &sid,
@@ -274,16 +294,16 @@ async fn h_pre(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value> 
                 );
             }
         }
-        corr.open_span(
-            &sid,
-            cwd.as_deref(),
+        corr.open_span(crate::correlator::OpenSpanArgs {
+            session_id: &sid,
+            cwd: cwd.as_deref(),
             tool_use_id,
             tool_name,
-            command.as_deref(),
+            command: command.as_deref(),
             agent_id,
             agent_type,
-            &procs,
-        );
+            procs: &procs,
+        });
     }
     Json(json!({}))
 }
@@ -337,7 +357,10 @@ async fn api_status(State(st): State<AppState>) -> Json<Value> {
         let corr = st.corr.lock().unwrap();
         (
             corr.sessions.len(),
-            corr.sessions.values().map(|s| s.sticky.len()).sum::<usize>(),
+            corr.sessions
+                .values()
+                .map(|s| s.sticky.len())
+                .sum::<usize>(),
         )
     };
     Json(json!({
@@ -354,7 +377,11 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
     let sessions: Vec<Value> = {
         let corr = st.corr.lock().unwrap();
         let mut rows: Vec<_> = corr.sessions.values().collect();
-        rows.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| {
+            b.cpu_pct
+                .partial_cmp(&a.cpu_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         rows.iter()
             .map(|s| {
                 json!({
@@ -377,7 +404,9 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
         .recent_findings(10)
         .unwrap_or_default()
         .into_iter()
-        .map(|(ts, kind, sev, msg)| json!({"ts": ts, "kind": kind, "severity": sev, "message": msg}))
+        .map(
+            |(ts, kind, sev, msg)| json!({"ts": ts, "kind": kind, "severity": sev, "message": msg}),
+        )
         .collect::<Vec<_>>();
     Json(json!({ "sessions": sessions, "findings": findings }))
 }
