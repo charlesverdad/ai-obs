@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-obs history</title>
+<style>
+  :root {
+    --bg: #08090a;
+    --panel: #0b0c0d;
+    --border: #1b1f21;
+    --border2: #15181a;
+    --border3: #2a2f31;
+    --track: #101314;
+    --fill: #181c1e;
+    --text-max: #f2f4f4;
+    --text-hi: #e8eaea;
+    --text-mid: #c9cfd1;
+    --text-dim: #8b9295;
+    --text-dim2: #6c7376;
+    --text-faint: #5a6165;
+    --text-faint2: #4d5457;
+    --red: #ff4d3d;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); }
+  body { font-family: var(--sans); color: var(--text-hi); }
+  a { color: var(--text-hi); text-decoration: none; border-bottom: 1px solid var(--border3); }
+  a:hover { color: #fff; border-bottom-color: var(--text-dim2); }
+  .wrap { padding: 40px 24px; }
+  .page { width: 100%; max-width: 1440px; margin: 0 auto; background: var(--panel); border: 1px solid var(--border); display: flex; flex-direction: column; }
+  .mono { font-family: var(--mono); }
+  .row { display: flex; align-items: center; }
+  .hdr { display:flex; align-items:center; justify-content:space-between; padding:20px 30px; border-bottom:1px solid var(--border); flex-wrap:wrap; gap:12px; }
+  .hdr-left { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  .logo { font-family:var(--mono); font-size:19px; font-weight:600; color:var(--text-max); }
+  .tag { font-family:var(--mono); font-size:13px; color:var(--text-dim2); }
+  .meta { font-family:var(--mono); font-size:12px; color:var(--text-faint); }
+  .hdr-right { display:flex; align-items:center; gap:22px; flex-wrap:wrap; }
+  .ranges { display:flex; border:1px solid var(--border); }
+  .range-btn { font-family:var(--mono); font-size:12px; padding:6px 14px; cursor:pointer; border-right:1px solid var(--border); color:var(--text-dim2); background:transparent; }
+  .range-btn:last-child { border-right:none; }
+  .range-btn.active { background:#1c2022; color:var(--text-max); }
+  .filterbar { display:flex; align-items:center; justify-content:space-between; gap:28px; padding:11px 30px; border-bottom:1px solid var(--border); font-family:var(--mono); font-size:12px; flex-wrap:wrap; }
+  .fb-group { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .fb-label { color:var(--text-faint); letter-spacing:.06em; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { padding:4px 10px; cursor:pointer; border:1px solid var(--border3); color:var(--text-dim); background:transparent; font-family:var(--mono); font-size:12px; }
+  .chip.active { color:var(--text-max); background:#1c2022; border-color:var(--text-dim2); }
+  .toggle { cursor:pointer; white-space:nowrap; color:var(--text-dim2); }
+  .toggle.active { color:var(--text-max); }
+  .sort-opt { cursor:pointer; padding-bottom:2px; border-bottom:1px solid transparent; color:var(--text-dim2); }
+  .sort-opt.active { color:var(--text-max); border-bottom-color:var(--text-mid); }
+  .reset { cursor:pointer; color:var(--text-faint); border-bottom:1px solid var(--border3); }
+  .reset.active { color:var(--text-max); }
+  .kpis { display:grid; grid-template-columns:repeat(5,1fr); border-bottom:1px solid var(--border); }
+  .kpi { padding:22px 30px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:8px; min-width:0; }
+  .kpi:last-child { border-right:none; }
+  .kpi-label { font-size:11px; letter-spacing:.1em; color:var(--text-dim2); font-weight:500; }
+  .kpi-val { font-family:var(--mono); font-size:32px; font-weight:500; line-height:1; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .kpi-unit { color:var(--text-faint); font-size:18px; }
+  .kpi-note { font-family:var(--mono); font-size:11px; color:var(--text-faint); }
+  .chart-section { padding:22px 30px 26px; border-bottom:1px solid var(--border); display:flex; flex-direction:column; gap:18px; }
+  .section-title { font-size:11px; letter-spacing:.1em; color:var(--text-dim); font-weight:500; }
+  .metric-picker { display:flex; gap:16px; font-family:var(--mono); font-size:11px; }
+  .bars { display:flex; align-items:flex-end; gap:3px; height:132px; border-bottom:1px solid var(--border3); }
+  .bar-col { flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:132px; min-width:2px; }
+  .bar { width:100%; background:var(--text-mid); }
+  .bar.hot { background:var(--red); }
+  .axis { display:flex; justify-content:space-between; font-family:var(--mono); font-size:10px; color:var(--text-faint); }
+  .panels { display:grid; grid-template-columns:1.15fr 1fr 1fr; border-bottom:1px solid var(--border); }
+  .panel { padding:22px 30px 26px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .panel:last-child { border-right:none; }
+  .thead { display:flex; font-family:var(--mono); font-size:10px; letter-spacing:.06em; color:var(--text-faint); }
+  .col-flex { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .col-r { text-align:right; }
+  .proj-row { display:flex; flex-direction:column; gap:6px; }
+  .proj-line { display:flex; font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; }
+  .proj-bar-track { height:3px; background:var(--border2); }
+  .proj-bar-fill { height:3px; background:var(--text-mid); }
+  .res-row, .heavy-row, .model-row { display:flex; font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; padding:3px 0; }
+  .hr { height:1px; background:var(--border); margin:4px 0 2px; }
+  .finding-row { display:flex; gap:10px; font-family:var(--mono); font-size:11px; line-height:1.5; padding:2px 0; }
+  .sessions-wrap { display:flex; flex-direction:column; border-bottom:1px solid var(--border); }
+  .sessions-hdr { display:flex; align-items:baseline; justify-content:space-between; padding:22px 30px 14px; flex-wrap:wrap; gap:6px; }
+  .sessions-thead { display:flex; padding:0 30px 8px; font-family:var(--mono); font-size:10px; letter-spacing:.06em; color:var(--text-faint); overflow-x:auto; }
+  .sessions-body { overflow-x:auto; }
+  .session-row { display:flex; align-items:center; padding:10px 30px; border-top:1px solid var(--border2); font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; cursor:pointer; }
+  .session-row:hover { background:#101213; }
+  .session-row.selected { background:#14181a; }
+  .empty-row { padding:16px 30px; border-top:1px solid var(--border2); font-family:var(--mono); font-size:12px; color:var(--text-faint); }
+  .replay { display:flex; flex-wrap:wrap; }
+  .replay-main { flex:1 1 600px; padding:22px 30px 28px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:18px; min-width:0; }
+  .replay-side { width:396px; flex:0 0 396px; padding:22px 30px 28px; display:flex; flex-direction:column; gap:20px; }
+  .replay-hdr { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+  .replay-title-group { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  .gantt-row { display:flex; align-items:center; gap:12px; height:19px; }
+  .gantt-label { width:172px; flex:none; font-family:var(--mono); font-size:11px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--text-dim); }
+  .gantt-track { flex:1; position:relative; height:11px; background:var(--track); }
+  .gantt-fill { position:absolute; top:0; height:11px; background:var(--text-mid); }
+  .gantt-num { width:74px; flex:none; text-align:right; font-family:var(--mono); font-size:11px; font-variant-numeric:tabular-nums; color:var(--text-dim); }
+  .gantt-note { width:96px; flex:none; text-align:right; font-family:var(--mono); font-size:11px; }
+  .fact-row { display:flex; font-family:var(--mono); font-size:12px; }
+  .fact-k { width:112px; flex:none; color:var(--text-faint); }
+  .fact-v { flex:1; overflow:hidden; text-overflow:ellipsis; color:var(--text-hi); }
+  .tree-row { display:flex; font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; }
+  .tree-name { flex:1; white-space:pre; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; }
+  .compare-row { display:flex; flex-direction:column; gap:5px; }
+  .compare-line { display:flex; justify-content:space-between; font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; }
+  .compare-track { height:3px; background:var(--border2); position:relative; }
+  .compare-fill { height:3px; background:var(--text-mid); }
+  .compare-notch { position:absolute; top:-2px; width:1px; height:7px; background:var(--text-faint2); }
+  .footer { display:flex; align-items:center; justify-content:space-between; padding:16px 30px; font-family:var(--mono); font-size:11px; color:var(--text-faint); flex-wrap:wrap; gap:8px; }
+  @media (max-width: 1200px) {
+    .panels { grid-template-columns:1fr; }
+    .panel { border-right:none; border-bottom:1px solid var(--border); }
+    .kpis { grid-template-columns:repeat(2,1fr); }
+    .kpi:nth-child(2n) { border-right:none; }
+    .kpi { border-bottom:1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap"><div class="page" id="page">
+  <div class="hdr">
+    <div class="hdr-left">
+      <div class="logo">ai-obs</div>
+      <div class="tag">history</div>
+      <div class="meta" id="hdrMeta">loading…</div>
+    </div>
+    <div class="hdr-right">
+      <div class="ranges" id="ranges"></div>
+      <div class="meta" id="dbNote"></div>
+    </div>
+  </div>
+
+  <div class="filterbar">
+    <div class="fb-group">
+      <span class="fb-label">PROJECT</span>
+      <div class="chips" id="projectChips"></div>
+    </div>
+    <div class="fb-group" style="gap:26px">
+      <div class="fb-group">
+        <span class="fb-label">ONLY</span>
+        <div class="chips" id="toggles" style="gap:16px"></div>
+      </div>
+      <div class="fb-group">
+        <span class="fb-label">SORT</span>
+        <div class="chips" id="sorts" style="gap:16px"></div>
+      </div>
+      <div class="fb-group">
+        <span class="meta" id="filterSummary"></span>
+        <span class="reset" id="resetBtn">reset</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="chart-section">
+    <div class="row" style="justify-content:space-between;align-items:baseline">
+      <div class="section-title" id="metricTitle">SPEND BY DAY</div>
+      <div class="metric-picker" id="metrics"></div>
+    </div>
+    <div class="bars" id="bars"></div>
+    <div class="axis" id="axis"><span id="axisStart"></span><span id="axisMid"></span><span id="axisEnd"></span></div>
+  </div>
+
+  <div class="panels">
+    <div class="panel">
+      <div class="section-title">SPEND BY PROJECT</div>
+      <div class="thead">
+        <span class="col-flex">PROJECT</span>
+        <span style="width:44px" class="col-r">SESS</span>
+        <span style="width:56px" class="col-r">IN</span>
+        <span style="width:56px" class="col-r">OUT</span>
+        <span style="width:66px" class="col-r">COST</span>
+      </div>
+      <div id="byProject" style="display:flex;flex-direction:column;gap:12px"></div>
+    </div>
+    <div class="panel">
+      <div class="section-title">RESOURCES BY PROJECT</div>
+      <div class="thead">
+        <span class="col-flex">PROJECT</span>
+        <span style="width:46px" class="col-r">CALLS</span>
+        <span style="width:50px" class="col-r">CPU S</span>
+        <span style="width:56px" class="col-r">PEAK</span>
+        <span style="width:38px" class="col-r">LEAK</span>
+      </div>
+      <div id="byResource"></div>
+      <div class="hr"></div>
+      <div class="section-title" style="padding-top:2px">HEAVIEST COMMANDS</div>
+      <div id="heaviest"></div>
+    </div>
+    <div class="panel">
+      <div class="section-title">TOKENS BY MODEL</div>
+      <div class="thead">
+        <span class="col-flex">MODEL</span>
+        <span style="width:46px" class="col-r">IN</span>
+        <span style="width:46px" class="col-r">OUT</span>
+        <span style="width:52px" class="col-r">CACHE</span>
+        <span style="width:56px" class="col-r">COST</span>
+      </div>
+      <div id="byModel"></div>
+      <div class="hr"></div>
+      <div class="section-title" style="padding-top:2px">FINDINGS IN RANGE</div>
+      <div id="findingsList"></div>
+    </div>
+  </div>
+
+  <div class="sessions-wrap">
+    <div class="sessions-hdr">
+      <div class="section-title">SESSIONS</div>
+      <div class="meta">newest first · click a row to replay it</div>
+    </div>
+    <div class="sessions-thead">
+      <span style="width:124px">STARTED</span>
+      <span style="width:130px">PROJECT</span>
+      <span style="width:150px">BRANCH</span>
+      <span style="width:58px">PR</span>
+      <span style="width:74px" class="col-r">DURATION</span>
+      <span style="width:62px" class="col-r">CALLS</span>
+      <span style="width:70px" class="col-r">CPU S</span>
+      <span style="width:70px" class="col-r">PEAK</span>
+      <span style="width:64px" class="col-r">TOK OUT</span>
+      <span style="width:74px" class="col-r">COST</span>
+      <span style="flex:1;padding-left:24px">ENDED</span>
+    </div>
+    <div class="sessions-body" id="sessionsBody"></div>
+  </div>
+
+  <div id="replayPanel"></div>
+
+  <div class="footer">
+    <span id="cmdHint"></span>
+    <span>read-only query · WAL · nothing leaves this machine</span>
+  </div>
+
+</div></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------------- format helpers ----------------
+
+  function fmtCompact(n) {
+    n = Number(n) || 0;
+    const sign = n < 0 ? '-' : '';
+    n = Math.abs(n);
+    if (n >= 1e9) return sign + (n / 1e9).toFixed(n >= 1e10 ? 0 : 1).replace(/\.0$/, '') + 'B';
+    if (n >= 1e6) return sign + (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+    if (n >= 1e3) return sign + (n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'K';
+    return sign + String(Math.round(n));
+  }
+
+  function fmtMem(mb) {
+    mb = Number(mb) || 0;
+    if (mb >= 1024) return (mb / 1024).toFixed(1) + 'GB';
+    return Math.round(mb) + 'MB';
+  }
+
+  function fmtDur(seconds) {
+    seconds = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return h + 'h' + String(m).padStart(2, '0') + 'm';
+    if (m > 0) return m + 'm' + String(s).padStart(2, '0') + 's';
+    return s + 's';
+  }
+
+  function mmss(seconds) {
+    seconds = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+
+  function fmtCost(n) {
+    n = Number(n) || 0;
+    return n.toFixed(2);
+  }
+
+  function fmtLocalDate(ymd) {
+    // ymd is 'YYYY-MM-DD'; render as e.g. 'Aug 12'.
+    const parts = (ymd || '').split('-');
+    if (parts.length !== 3) return ymd || '';
+    const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+
+  function fmtWhen(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+      d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function fmtAgo(ms) {
+    if (!ms) return '—';
+    const diff = Date.now() - ms;
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'now';
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  // ---------------- state ----------------
+
+  const state = {
+    days: 30,
+    metric: 'cost',
+    project: null,
+    onlyFindings: false,
+    onlyFailed: false,
+    sort: 'recent',
+    selectedSession: null,
+  };
+
+  const RANGES = [7, 30, 90];
+  const METRICS = [
+    { key: 'cost', label: 'COST' },
+    { key: 'cpu', label: 'CPU' },
+    { key: 'tokens', label: 'TOKENS' },
+  ];
+  const SORTS = [
+    { key: 'recent', label: 'RECENT' },
+    { key: 'cost', label: 'COST' },
+    { key: 'cpu', label: 'CPU' },
+    { key: 'calls', label: 'CALLS' },
+  ];
+
+  let historyData = null;
+  const sessionCache = {};
+
+  // ---------------- data ----------------
+
+  async function fetchHistory() {
+    const q = new URLSearchParams({ days: String(state.days) });
+    if (state.project) q.set('project', state.project);
+    const res = await fetch('/api/history?' + q.toString());
+    historyData = await res.json();
+    if (!state.selectedSession && historyData.sessions && historyData.sessions.length) {
+      state.selectedSession = historyData.sessions[0].id;
+    }
+    renderAll();
+    if (state.selectedSession) selectSession(state.selectedSession);
+    else renderReplay(null);
+  }
+
+  async function fetchSession(id) {
+    if (sessionCache[id]) return sessionCache[id];
+    const res = await fetch('/api/session/' + encodeURIComponent(id));
+    if (!res.ok) return null;
+    const v = await res.json();
+    sessionCache[id] = v;
+    return v;
+  }
+
+  async function selectSession(id) {
+    state.selectedSession = id;
+    highlightSelectedRow();
+    const data = await fetchSession(id);
+    renderReplay(data);
+  }
+
+  // ---------------- render: header / filters ----------------
+
+  function renderAll() {
+    renderHeader();
+    renderRanges();
+    renderProjectChips();
+    renderToggles();
+    renderSorts();
+    renderFilterSummary();
+    renderKpis();
+    renderMetrics();
+    renderBars();
+    renderPanels();
+    renderSessionsTable();
+    renderFooter();
+  }
+
+  function renderHeader() {
+    const d = historyData;
+    document.getElementById('hdrMeta').textContent =
+      `last ${d.range.days} days · ${d.session_count} sessions · ${d.span_count} tool calls`;
+    const db = d.db || {};
+    document.getElementById('dbNote').textContent =
+      `${db.path || '?'} · ${db.size_mb != null ? db.size_mb + ' MB' : '?'} · read-only`;
+  }
+
+  function renderRanges() {
+    const el = document.getElementById('ranges');
+    el.innerHTML = '';
+    for (const r of RANGES) {
+      const btn = document.createElement('div');
+      btn.className = 'range-btn' + (state.days === r ? ' active' : '');
+      btn.textContent = r + 'D';
+      btn.onclick = () => { state.days = r; fetchHistory(); };
+      el.appendChild(btn);
+    }
+  }
+
+  function renderProjectChips() {
+    const el = document.getElementById('projectChips');
+    el.innerHTML = '';
+    const all = document.createElement('span');
+    all.className = 'chip' + (!state.project ? ' active' : '');
+    all.textContent = 'all';
+    all.onclick = () => { state.project = null; fetchHistory(); };
+    el.appendChild(all);
+    for (const p of historyData.by_project || []) {
+      const chip = document.createElement('span');
+      chip.className = 'chip' + (state.project === p.project ? ' active' : '');
+      chip.textContent = p.project;
+      chip.onclick = () => { state.project = p.project; fetchHistory(); };
+      el.appendChild(chip);
+    }
+  }
+
+  function renderToggles() {
+    const el = document.getElementById('toggles');
+    el.innerHTML = '';
+    const defs = [
+      { key: 'onlyFindings', label: 'with findings' },
+      { key: 'onlyFailed', label: 'failed tool calls' },
+    ];
+    for (const t of defs) {
+      const span = document.createElement('span');
+      span.className = 'toggle' + (state[t.key] ? ' active' : '');
+      span.textContent = (state[t.key] ? '● ' : '○ ') + t.label;
+      span.onclick = () => { state[t.key] = !state[t.key]; renderSessionsTable(); renderFilterSummary(); renderToggles(); };
+      el.appendChild(span);
+    }
+  }
+
+  function renderSorts() {
+    const el = document.getElementById('sorts');
+    el.innerHTML = '';
+    for (const s of SORTS) {
+      const span = document.createElement('span');
+      span.className = 'sort-opt' + (state.sort === s.key ? ' active' : '');
+      span.textContent = s.label;
+      span.onclick = () => { state.sort = s.key; renderSessionsTable(); renderSorts(); };
+      el.appendChild(span);
+    }
+  }
+
+  function isDefaultFilters() {
+    return !state.project && !state.onlyFindings && !state.onlyFailed && state.sort === 'recent';
+  }
+
+  function renderFilterSummary() {
+    const bits = [];
+    if (state.project) bits.push(state.project);
+    if (state.onlyFindings) bits.push('with findings');
+    if (state.onlyFailed) bits.push('failed calls');
+    if (state.sort !== 'recent') bits.push('sorted by ' + state.sort);
+    document.getElementById('filterSummary').textContent = bits.length ? bits.join(' · ') : 'no filters';
+    const reset = document.getElementById('resetBtn');
+    reset.className = 'reset' + (isDefaultFilters() ? '' : ' active');
+  }
+
+  document.getElementById('resetBtn').onclick = () => {
+    const daysChanged = state.days !== 30;
+    state.project = null;
+    state.onlyFindings = false;
+    state.onlyFailed = false;
+    state.sort = 'recent';
+    state.days = 30;
+    if (daysChanged) fetchHistory(); else { renderProjectChips(); renderToggles(); renderSorts(); renderFilterSummary(); renderSessionsTable(); fetchHistory(); }
+  };
+
+  // ---------------- render: kpis ----------------
+
+  function renderKpis() {
+    const k = historyData.kpis;
+    const deltaPct = k.prev_cost_usd > 0 ? ((k.cost_usd - k.prev_cost_usd) / k.prev_cost_usd) * 100 : null;
+    const deltaStr = deltaPct == null ? 'n/a' : (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(0) + '%';
+    const el = document.getElementById('kpis');
+    el.innerHTML = `
+      <div class="kpi">
+        <div class="kpi-label">SPEND</div>
+        <div class="kpi-val mono"><span class="kpi-unit">$</span><span>${fmtCost(k.cost_usd)}</span></div>
+        <div class="kpi-note">${esc(deltaStr)} vs previous ${historyData.range.days}d</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">CPU</div>
+        <div class="kpi-val mono">${fmtCompact(k.core_hours)}<span class="kpi-unit"> core-h</span></div>
+        <div class="kpi-note">busiest day ${esc(fmtLocalDate(k.busiest_day))}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">TOKENS</div>
+        <div class="kpi-val mono">${fmtCompact(k.tokens_in + k.tokens_out)}</div>
+        <div class="kpi-note">${fmtCompact(k.cache_read)} read from cache</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">LEAKED PROCS</div>
+        <div class="kpi-val mono">${fmtCompact(k.leaked_procs)}</div>
+        <div class="kpi-note">across ${k.leaked_spans} tool calls</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">FINDINGS</div>
+        <div class="kpi-val mono"><span style="color:var(--red)">${k.findings_crit}</span><span class="kpi-unit"> crit</span>  <span class="kpi-unit">${k.findings_warn} warn</span></div>
+        <div class="kpi-note">${k.finding_sessions} sessions affected</div>
+      </div>
+    `;
+  }
+
+  // ---------------- render: day bar chart ----------------
+
+  function renderMetrics() {
+    const el = document.getElementById('metrics');
+    el.innerHTML = '';
+    for (const m of METRICS) {
+      const span = document.createElement('span');
+      span.className = 'sort-opt' + (state.metric === m.key ? ' active' : '');
+      span.textContent = m.label;
+      span.onclick = () => { state.metric = m.key; renderMetrics(); renderBars(); };
+      el.appendChild(span);
+    }
+    document.getElementById('metricTitle').textContent =
+      { cost: 'SPEND BY DAY', cpu: 'CPU BY DAY', tokens: 'TOKENS BY DAY' }[state.metric];
+  }
+
+  function hotDayThreshold(days) {
+    const nonzero = days.map((d) => d.orphan_findings).filter((n) => n > 0).sort((a, b) => a - b);
+    if (nonzero.length < 3) return Infinity;
+    const idx = Math.max(0, Math.ceil(nonzero.length * 0.9) - 1);
+    return nonzero[idx];
+  }
+
+  function renderBars() {
+    const days = historyData.days;
+    const metricVal = (d) => (state.metric === 'cost' ? d.cost : state.metric === 'cpu' ? d.core_hours : d.tokens);
+    const max = Math.max(1e-9, ...days.map(metricVal));
+    const threshold = hotDayThreshold(days);
+    const el = document.getElementById('bars');
+    el.innerHTML = '';
+    for (const d of days) {
+      const v = metricVal(d);
+      const h = Math.max(1, Math.round((v / max) * 132));
+      const hot = d.orphan_findings >= threshold && d.orphan_findings >= 3;
+      const col = document.createElement('div');
+      col.className = 'bar-col';
+      col.title = `${fmtLocalDate(d.date)} · $${fmtCost(d.cost)} · ${d.core_hours.toFixed(1)} core-h · ${fmtCompact(d.tokens)} tok · ${d.sessions} sessions${d.orphan_findings ? ' · ' + d.orphan_findings + ' orphan findings' : ''}`;
+      const bar = document.createElement('div');
+      bar.className = 'bar' + (hot ? ' hot' : '');
+      bar.style.height = h + 'px';
+      col.appendChild(bar);
+      el.appendChild(col);
+    }
+    document.getElementById('axisStart').textContent = days.length ? fmtLocalDate(days[0].date) : '';
+    document.getElementById('axisMid').textContent = days.length ? fmtLocalDate(days[Math.floor(days.length / 2)].date) : '';
+    document.getElementById('axisEnd').textContent = days.length ? fmtLocalDate(days[days.length - 1].date) : '';
+  }
+
+  // ---------------- render: panels ----------------
+
+  function renderPanels() {
+    // Spend by project
+    const byProject = historyData.by_project || [];
+    const maxCost = Math.max(1e-9, ...byProject.map((p) => p.cost));
+    document.getElementById('byProject').innerHTML = byProject.map((p) => `
+      <div class="proj-row">
+        <div class="proj-line">
+          <span class="col-flex" style="color:var(--text-hi)">${esc(p.project)}</span>
+          <span style="width:44px;color:var(--text-dim2)" class="col-r">${p.sessions}</span>
+          <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtCompact(p.tokens_in)}</span>
+          <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtCompact(p.tokens_out)}</span>
+          <span style="width:66px;color:var(--text-max)" class="col-r">$${fmtCost(p.cost)}</span>
+        </div>
+        <div class="proj-bar-track"><div class="proj-bar-fill" style="width:${Math.round((p.cost / maxCost) * 100)}%"></div></div>
+      </div>
+    `).join('') || emptyNote('no spend in range');
+
+    // Resources by project
+    const byResource = historyData.by_resource || [];
+    document.getElementById('byResource').innerHTML = byResource.map((p) => `
+      <div class="res-row">
+        <span class="col-flex" style="color:var(--text-hi)">${esc(p.project)}</span>
+        <span style="width:46px;color:var(--text-dim)" class="col-r">${p.calls}</span>
+        <span style="width:50px;color:var(--text-mid)" class="col-r">${p.cpu_s.toFixed(1)}</span>
+        <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtMem(p.peak_mb)}</span>
+        <span style="width:38px;color:${p.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${p.leaked}</span>
+      </div>
+    `).join('') || emptyNote('no resource data');
+
+    const heaviest = historyData.heaviest || [];
+    document.getElementById('heaviest').innerHTML = heaviest.map((h) => `
+      <div class="heavy-row">
+        <span class="col-flex" style="color:var(--text-hi)">${esc(h.tool)}${h.cmd ? ' · ' + esc(h.cmd) : ''}</span>
+        <span style="width:46px;color:var(--text-dim2)" class="col-r">${h.calls}</span>
+        <span style="width:50px;color:var(--text-mid)" class="col-r">${h.cpu_s.toFixed(1)}</span>
+        <span style="width:56px;color:var(--text-dim)" class="col-r">${fmtMem(h.peak_mb)}</span>
+        <span style="width:38px;color:${h.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)'}" class="col-r">${h.leaked}</span>
+      </div>
+    `).join('') || emptyNote('no tool calls in range');
+
+    // Tokens by model
+    const byModel = historyData.by_model || [];
+    document.getElementById('byModel').innerHTML = byModel.map((m) => `
+      <div class="model-row">
+        <span class="col-flex" style="color:var(--text-hi)">${esc(m.model)}</span>
+        <span style="width:46px;color:var(--text-dim)" class="col-r">${fmtCompact(m.tokens_in)}</span>
+        <span style="width:46px;color:var(--text-dim)" class="col-r">${fmtCompact(m.tokens_out)}</span>
+        <span style="width:52px;color:var(--text-dim2)" class="col-r">${fmtCompact(m.cache)}</span>
+        <span style="width:56px;color:var(--text-max)" class="col-r">$${fmtCost(m.cost)}</span>
+      </div>
+    `).join('') || emptyNote('no usage in range');
+
+    const findings = historyData.findings || [];
+    const sevColor = (s) => (s === 'crit' ? 'var(--red)' : 'var(--text-dim)');
+    document.getElementById('findingsList').innerHTML = findings.map((f) => `
+      <div class="finding-row">
+        <span style="width:74px;flex:none;color:${sevColor(f.severity)};white-space:nowrap">${esc(f.kind)}</span>
+        <span style="flex:1;color:var(--text-dim)">${esc(f.message)}</span>
+        <span style="width:52px;flex:none;text-align:right;color:var(--text-faint2)">${fmtAgo(f.ts)}</span>
+      </div>
+    `).join('') || emptyNote('no findings in range');
+  }
+
+  function emptyNote(text) {
+    return `<div class="meta" style="padding:4px 0">${esc(text)}</div>`;
+  }
+
+  // ---------------- render: sessions table ----------------
+
+  function filteredSortedSessions() {
+    let rows = (historyData.sessions || []).slice();
+    if (state.onlyFindings) rows = rows.filter((s) => s.leaked > 0);
+    if (state.onlyFailed) rows = rows.filter((s) => s.failed > 0);
+    const cmp = {
+      recent: (a, b) => b.started_at - a.started_at,
+      cost: (a, b) => b.cost - a.cost,
+      cpu: (a, b) => b.cpu_s - a.cpu_s,
+      calls: (a, b) => b.calls - a.calls,
+    }[state.sort] || ((a, b) => b.started_at - a.started_at);
+    rows.sort(cmp);
+    return rows;
+  }
+
+  function renderSessionsTable() {
+    const rows = filteredSortedSessions();
+    const body = document.getElementById('sessionsBody');
+    if (!rows.length) {
+      body.innerHTML = `<div class="empty-row">no sessions match this filter</div>`;
+      renderReplay(null);
+      return;
+    }
+    body.innerHTML = rows.map((s) => {
+      const mark = s.leaked > 0 ? 'var(--red)' : (s.failed > 0 ? 'var(--text-dim)' : 'transparent');
+      const flag = s.leaked > 0 ? `${s.leaked} leaked` : (s.failed > 0 ? `${s.failed} failed` : '');
+      const flagColor = s.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
+      return `
+      <div class="session-row${state.selectedSession === s.id ? ' selected' : ''}" data-id="${esc(s.id)}">
+        <span style="width:124px;display:flex;align-items:center;gap:9px">
+          <span style="width:3px;height:12px;background:${mark}"></span>
+          <span style="color:var(--text-dim)">${esc(fmtWhen(s.started_at))}</span>
+        </span>
+        <span style="width:130px;color:var(--text-max);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.project || '?')}</span>
+        <span style="width:150px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.branch || '—')}</span>
+        <span style="width:58px;color:var(--text-dim2)">${s.pr_number ? '#' + s.pr_number : '—'}</span>
+        <span style="width:74px;color:var(--text-dim)" class="col-r">${fmtDur(s.duration_s)}</span>
+        <span style="width:62px;color:var(--text-dim)" class="col-r">${s.calls}</span>
+        <span style="width:70px;color:var(--text-mid)" class="col-r">${s.cpu_s.toFixed(1)}</span>
+        <span style="width:70px;color:var(--text-dim)" class="col-r">${fmtMem(s.peak_mb)}</span>
+        <span style="width:64px;color:var(--text-dim)" class="col-r">${fmtCompact(s.tokens_out)}</span>
+        <span style="width:74px;color:var(--text-max)" class="col-r">$${fmtCost(s.cost)}</span>
+        <span style="flex:1;padding-left:24px;display:flex;align-items:center;gap:10px;white-space:nowrap;overflow:hidden">
+          <span style="color:var(--text-dim2)">${esc(s.end_reason || (s.ended_at ? 'ended' : 'running'))}</span>
+          <span style="color:${flagColor}">${esc(flag)}</span>
+        </span>
+      </div>`;
+    }).join('');
+    for (const row of body.querySelectorAll('.session-row')) {
+      row.onclick = () => selectSession(row.getAttribute('data-id'));
+    }
+  }
+
+  function highlightSelectedRow() {
+    for (const row of document.querySelectorAll('.session-row')) {
+      row.classList.toggle('selected', row.getAttribute('data-id') === state.selectedSession);
+    }
+  }
+
+  // ---------------- render: session replay ----------------
+
+  function renderReplay(data) {
+    const panel = document.getElementById('replayPanel');
+    if (!data) { panel.innerHTML = ''; return; }
+    const f = data.facts;
+    const durationS = f.ended_at ? (f.ended_at - f.started_at) / 1000 : (Date.now() - f.started_at) / 1000;
+
+    if (!data.samples.length && !data.spans.length) {
+      panel.innerHTML = `
+        <div class="replay">
+          <div class="replay-main" style="border-right:none">
+            <div class="replay-hdr">
+              <div class="replay-title-group">
+                <div class="section-title">SESSION REPLAY</div>
+                <div class="mono" style="font-size:13px;color:var(--text-max)">${esc(f.project || '?')}</div>
+                <div class="meta">${esc(fmtWhen(f.started_at))} · ${fmtDur(durationS)}</div>
+              </div>
+            </div>
+            <div class="meta" style="padding:20px 0">no resource telemetry — session predates hook install</div>
+          </div>
+          <div class="replay-side">${renderFacts(f)}</div>
+        </div>`;
+      return;
+    }
+
+    panel.innerHTML = `
+      <div class="replay">
+        <div class="replay-main">
+          <div class="replay-hdr">
+            <div class="replay-title-group">
+              <div class="section-title">SESSION REPLAY</div>
+              <div class="mono" style="font-size:13px;color:var(--text-max)">${esc(f.project || '?')}</div>
+              <div class="meta">${esc(fmtWhen(f.started_at))} · ${fmtDur(durationS)}</div>
+            </div>
+            <div class="meta">session_sample at 1 Hz · ${data.spans.length} of ${data.spans_total} tool_span rows shown</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div class="row" style="justify-content:space-between" >
+              <span class="meta">CPU % (fill) · FOOTPRINT (line)</span>
+              <span class="meta" id="replayPeaks"></span>
+            </div>
+            <div id="replaySvgWrap"></div>
+          </div>
+          <div id="gantt" style="display:flex;flex-direction:column;gap:5px"></div>
+          <div class="axis" id="ganttAxis" style="padding-left:184px"></div>
+        </div>
+        <div class="replay-side">
+          ${renderFacts(f)}
+          <div class="hr"></div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="section-title" id="treeTitle">PROCESS TREE</div>
+            <div id="tree"></div>
+            <div class="meta" id="treeNote" style="line-height:1.6;padding-top:2px"></div>
+          </div>
+          <div class="hr"></div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="section-title">THIS SESSION vs ${esc(f.project || '?')} MEDIAN</div>
+            <div id="compare" style="display:flex;flex-direction:column;gap:14px"></div>
+          </div>
+        </div>
+      </div>`;
+
+    renderSvg(data.samples);
+    renderGantt(data.spans, f.started_at, durationS);
+    renderTree(data.tree);
+    renderCompare(data.medians);
+  }
+
+  function renderFacts(f) {
+    const rows = [
+      ['project', f.project || '?'],
+      ['root', f.project_root || '—'],
+      ['branch', f.branch || '—'],
+      ['pr', f.pr_url ? `<a href="${esc(f.pr_url)}" target="_blank" rel="noopener">#${f.pr_number}</a>` : (f.pr_number ? '#' + f.pr_number : '—')],
+      ['claude pid', f.claude_pid != null ? f.claude_pid : '—'],
+      ['cc version', f.cc_version || '—'],
+      ['end reason', f.end_reason || (f.ended_at ? '—' : 'running')],
+      ['calls', f.calls],
+      ['tokens', `${fmtCompact(f.tokens_in)} in · ${fmtCompact(f.tokens_out)} out · ${fmtCompact(f.cache_read)} cache`],
+      ['cost', `$${fmtCost(f.cost)}${f.unpriced ? ` (+${f.unpriced} unpriced)` : ''}`],
+    ];
+    return `
+      <div style="display:flex;flex-direction:column;gap:9px">
+        <div class="section-title">SESSION</div>
+        ${rows.map(([k, v]) => `<div class="fact-row"><span class="fact-k">${esc(k)}</span><span class="fact-v">${v}</span></div>`).join('')}
+      </div>`;
+  }
+
+  function renderSvg(samples) {
+    const wrap = document.getElementById('replaySvgWrap');
+    if (!wrap) return;
+    if (!samples.length) {
+      wrap.innerHTML = `<div class="meta" style="padding:12px 0">no session_sample rows for this session</div>`;
+      document.getElementById('replayPeaks').textContent = '';
+      return;
+    }
+    const W = 900, H = 190;
+    const maxCpu = Math.max(1, ...samples.map((s) => s.cpu_pct));
+    const maxMem = Math.max(1, ...samples.map((s) => s.footprint));
+    const n = samples.length;
+    const px = (i) => (n <= 1 ? 0 : (i / (n - 1)) * W);
+    const pyc = (v) => H - (Math.min(v, maxCpu) / maxCpu) * (H - 2) - 1;
+    const pym = (v) => H - (v / maxMem) * (H - 2) - 1;
+
+    let cpuLine = '', cpuArea = `M0,${H - 1} `;
+    let memLine = '';
+    samples.forEach((s, i) => {
+      const x = px(i).toFixed(1);
+      const yc = pyc(s.cpu_pct).toFixed(1);
+      const ym = pym(s.footprint).toFixed(1);
+      cpuLine += (i === 0 ? 'M' : 'L') + x + ',' + yc + ' ';
+      cpuArea += 'L' + x + ',' + yc + ' ';
+      memLine += (i === 0 ? 'M' : 'L') + x + ',' + ym + ' ';
+    });
+    cpuArea += `L${W},${H - 1} Z`;
+
+    wrap.innerHTML = `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:190px;display:block">
+        <line x1="0" y1="1" x2="${W}" y2="1" stroke="var(--border)"></line>
+        <line x1="0" y1="95" x2="${W}" y2="95" stroke="var(--border2)"></line>
+        <line x1="0" y1="${H - 1}" x2="${W}" y2="${H - 1}" stroke="var(--border3)"></line>
+        <path d="${cpuArea}" fill="var(--fill)"></path>
+        <path d="${cpuLine}" fill="none" stroke="var(--text-dim)" stroke-width="1"></path>
+        <path d="${memLine}" fill="none" stroke="var(--text-hi)" stroke-width="1.5"></path>
+      </svg>`;
+    document.getElementById('replayPeaks').textContent =
+      `${maxCpu.toFixed(0)}% peak · ${fmtMem(maxMem / 1e6)} peak footprint`;
+  }
+
+  function renderGantt(spans, sessionStart, durationS) {
+    const el = document.getElementById('gantt');
+    const durMs = Math.max(1, durationS * 1000);
+    if (!spans.length) {
+      el.innerHTML = `<div class="meta" style="padding:8px 0">no tool_span rows for this session</div>`;
+      document.getElementById('ganttAxis').innerHTML = '';
+      return;
+    }
+    el.innerHTML = spans.map((g) => {
+      const left = Math.max(0, Math.min(100, ((g.started_at - sessionStart) / durMs) * 100));
+      const width = Math.max(0.3, Math.min(100 - left, (((g.ended_at || sessionStart + durMs) - g.started_at) / durMs) * 100));
+      const failed = g.ok === false;
+      const color = failed ? 'var(--red)' : (g.leaked > 0 ? 'var(--red)' : 'var(--text-mid)');
+      const labelColor = failed ? 'var(--red)' : 'var(--text-dim)';
+      const note = failed ? 'failed' : (g.leaked > 0 ? `${g.leaked} leaked` : '');
+      const noteColor = failed || g.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
+      const label = g.cmd ? `${g.tool} · ${g.cmd}` : g.tool;
+      return `
+        <div class="gantt-row">
+          <span class="gantt-label" style="color:${labelColor}" title="${esc(label)}">${esc(label)}</span>
+          <span class="gantt-track"><span class="gantt-fill" style="left:${left}%;width:${width}%;background:${color}"></span></span>
+          <span class="gantt-num">${g.cpu_s.toFixed(1)}s</span>
+          <span class="gantt-num" style="color:var(--text-dim2)">${fmtMem(g.peak_mb)}</span>
+          <span class="gantt-note" style="color:${noteColor}">${esc(note)}</span>
+        </div>`;
+    }).join('');
+    const axis = document.getElementById('ganttAxis');
+    axis.innerHTML = `<span>00:00</span><span>${mmss(durationS * 0.33)}</span><span>${mmss(durationS * 0.66)}</span><span>${mmss(durationS)}</span>`;
+  }
+
+  function renderTree(tree) {
+    const container = document.getElementById('tree');
+    const note = document.getElementById('treeNote');
+    const title = document.getElementById('treeTitle');
+    if (!tree || !tree.procs || !tree.procs.length) {
+      title.textContent = 'PROCESS TREE';
+      container.innerHTML = '';
+      note.textContent = 'no process telemetry for this session';
+      return;
+    }
+    title.textContent = 'PROCESS TREE — ' + (tree.cmd || '');
+    container.innerHTML = tree.procs.map((p) => {
+      const indent = p.depth > 0 ? '└ '.padStart(p.depth * 2 + 2, ' ') : '';
+      const name = indent + p.name + (p.orphaned ? ' orphaned' : '');
+      return `
+        <div class="tree-row">
+          <span class="tree-name" style="color:${p.orphaned ? 'var(--red)' : 'var(--text-dim)'}">${esc(name)}</span>
+          <span style="width:58px;text-align:right;color:var(--text-dim)">${p.cpu_s.toFixed(1)}s</span>
+          <span style="width:62px;text-align:right;color:var(--text-dim2)">${fmtMem(p.peak_mb)}</span>
+        </div>`;
+    }).join('');
+    note.textContent = '';
+  }
+
+  function renderCompare(medians) {
+    const el = document.getElementById('compare');
+    if (!medians) { el.innerHTML = ''; return; }
+    const proj = medians.project, sess = medians.session;
+    const defs = [
+      { key: 'cost', label: 'COST', fmt: (v) => '$' + fmtCost(v) },
+      { key: 'cpu_s', label: 'CPU S', fmt: (v) => v.toFixed(1) },
+      { key: 'peak_mb', label: 'PEAK MEM', fmt: (v) => fmtMem(v) },
+      { key: 'calls', label: 'CALLS', fmt: (v) => Math.round(v) },
+    ];
+    el.innerHTML = defs.map((d) => {
+      const v = sess[d.key] || 0;
+      const m = proj[d.key] || 0;
+      const cap = Math.max(v, m, 1e-9) > m * 2.4 ? m * 2.4 : Math.max(v, m, 1e-9);
+      const w = Math.min(100, (v / cap) * 100);
+      const medianW = Math.min(100, (m / cap) * 100);
+      const delta = m > 0 ? ((v - m) / m) * 100 : null;
+      const deltaStr = delta == null ? '' : (delta >= 0 ? '+' : '') + delta.toFixed(0) + '%';
+      const deltaColor = delta == null ? 'var(--text-dim2)' : (delta > 0 ? 'var(--red)' : 'var(--text-dim2)');
+      return `
+        <div class="compare-row">
+          <div class="compare-line">
+            <span style="color:var(--text-dim)">${d.label}</span>
+            <span style="color:var(--text-max)">${d.fmt(v)}<span style="color:${deltaColor}"> ${esc(deltaStr)}</span></span>
+          </div>
+          <div class="compare-track">
+            <div class="compare-fill" style="width:${w}%"></div>
+            <div class="compare-notch" style="left:${medianW}%"></div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  // ---------------- footer ----------------
+
+  function renderFooter() {
+    const bits = [];
+    bits.push(`${historyData.range.days}d`);
+    if (state.project) bits.push(state.project);
+    if (state.onlyFindings) bits.push('with-findings');
+    if (state.onlyFailed) bits.push('failed');
+    if (state.sort !== 'recent') bits.push('sort=' + state.sort);
+    document.getElementById('cmdHint').textContent = 'ai-obs report --range ' + bits.join(' --');
+  }
+
+  // ---------------- init ----------------
+
+  fetchHistory().catch((e) => {
+    document.getElementById('hdrMeta').textContent = 'failed to load: ' + e;
+  });
+})();
+</script>
+</body>
+</html>

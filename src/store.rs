@@ -186,6 +186,11 @@ CREATE TABLE IF NOT EXISTS finding (
   message TEXT NOT NULL,
   resolved_at INTEGER
 );
+-- Historical dashboard aggregates (src/history.rs) range-filter on these
+-- columns; CREATE INDEX IF NOT EXISTS is naturally idempotent so this needs
+-- no pragma-guarded migration like the ALTER TABLE below.
+CREATE INDEX IF NOT EXISTS idx_llm_ts ON llm_usage(ts);
+CREATE INDEX IF NOT EXISTS idx_span_started ON tool_span(started_at);
 "#;
 
 /// Schema migrations that ALTER an existing table rather than CREATE it —
