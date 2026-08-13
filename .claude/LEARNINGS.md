@@ -121,3 +121,13 @@ and load-bearing — this is not a changelog.
   handler directly — building a real `Next` in a unit test needs the full
   tower service stack (not a dependency this repo pulls in), while the pure
   predicate is trivially testable and is what actually encodes the policy.
+
+- **Subagent hook payloads (verified empirically 2026-08-13, CC 2.1.229)**:
+  `SubagentStart` carries only `agent_id`, `agent_type`, `cwd`, `prompt_id`,
+  `session_id`, `transcript_path`. `SubagentStop` additionally carries
+  `agent_transcript_path` (the subagent's own `agent-<id>.jsonl` — a separate
+  field from `transcript_path`), `last_assistant_message`, `stop_hook_active`,
+  `background_tasks`, `session_crons`, `effort`, `permission_mode`. Hook
+  changes in settings.json applied to already-running sessions in practice
+  (SubagentStart fired from a session started before install) — don't rely
+  on it, but don't assume a restart is required either.
