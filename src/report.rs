@@ -56,7 +56,7 @@ pub fn run(opts: &ReportOpts) -> Result<()> {
                 COUNT(t.id) tool_calls,
                 ROUND(SUM(COALESCE(t.cpu_ns, t.cpu_ns_sampled))/1e9, 1) cpu_seconds,
                 ROUND(MAX(t.peak_footprint)/1e6) peak_mb,
-                SUM(t.leaked_count) leaked_procs
+                SUM(t.orphaned_count) orphaned_procs
              FROM project pr
              JOIN session s ON s.project_id = pr.id
              JOIN tool_span t ON t.session_id = s.id
@@ -161,7 +161,7 @@ fn print_markdown(v: &Value) {
     }
 
     println!("\n## Resources by project\n");
-    println!("| project | tool calls | CPU s | peak MB | leaked procs |");
+    println!("| project | tool calls | CPU s | peak MB | orphaned procs |");
     println!("|---|---:|---:|---:|---:|");
     for r in v["resources"].as_array().unwrap_or(&vec![]) {
         println!(
@@ -170,7 +170,7 @@ fn print_markdown(v: &Value) {
             r["tool_calls"],
             r["cpu_seconds"],
             r["peak_mb"],
-            r["leaked_procs"]
+            r["orphaned_procs"]
         );
     }
 

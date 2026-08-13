@@ -77,7 +77,7 @@ pub struct FlatRow {
     pub tok_out: String,
     pub cost: String,
     pub current: String,
-    /// Highlight (FAIL / leaked / high cpu) — rendered in a warn color.
+    /// Highlight (FAIL / orphaned / high cpu) — rendered in a warn color.
     pub warn: bool,
 }
 
@@ -223,11 +223,11 @@ fn span_row(
         .or_else(|| span["tool_use_id"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| idx.to_string());
     let ok = span.get("ok").and_then(|v| v.as_bool());
-    let leaked = i64_of(span, "leaked_count");
+    let orphaned = i64_of(span, "orphaned_count");
     let status = if running {
         "RUNNING".to_string()
-    } else if leaked > 0 {
-        format!("leaked\u{26a0}{leaked}")
+    } else if orphaned > 0 {
+        format!("orphaned\u{26a0}{orphaned}")
     } else {
         match ok {
             Some(true) => "ok".to_string(),
@@ -258,7 +258,7 @@ fn span_row(
         tok_out: String::new(),
         cost: String::new(),
         current: status.clone(),
-        warn: status == "FAIL" || leaked > 0,
+        warn: status == "FAIL" || orphaned > 0,
     }
 }
 
@@ -619,7 +619,7 @@ mod tests {
                             "cpu_s": 41.2,
                             "peak_mb": 1900,
                             "ok": null,
-                            "leaked_count": 0,
+                            "orphaned_count": 0,
                             "running": true,
                             "pid": 555
                         }],
@@ -631,7 +631,7 @@ mod tests {
                             "cpu_s": 18.4,
                             "peak_mb": 890,
                             "ok": true,
-                            "leaked_count": 0,
+                            "orphaned_count": 0,
                             "running": false,
                             "pid": null
                         }]

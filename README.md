@@ -4,7 +4,7 @@ Local-first observability for Claude Code agents: CPU, memory, tokens, and
 cost per tool call, grouped by project.
 
 If you run several Claude Code instances at once, one of them eventually
-leaks a process, spins a test loop, or burns tokens on the wrong branch —
+orphans a process, spins a test loop, or burns tokens on the wrong branch —
 and there's no way to tell which session, project, or tool call is
 responsible. ai-obs attributes resource use down to the individual tool
 call so you can find the culprit instead of guessing from `top`.

@@ -155,16 +155,16 @@ started_at    1786528700437          ended_at  NULL   <span class="c">(still liv
 <tr><td class="f">peak_footprint</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Max phys_footprint high-water mark across the span's processes (what Activity Monitor calls "memory")</td></tr>
 <tr><td class="f">disk_read, disk_write</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Bytes of real disk I/O</td></tr>
 <tr><td class="f">proc_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Distinct processes attributed to the span</td></tr>
-<tr><td class="f">leaked_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Processes still alive when the span closed (allowlisted language servers excluded) — the orphan signal</td></tr>
+<tr><td class="f">orphaned_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Processes still alive when the span closed (allowlisted language servers excluded) — the orphan signal</td></tr>
 </tbody></table></div>
-<div class="sample"><span class="c">-- sample: `just test` that leaked a dev server</span>
+<div class="sample"><span class="c">-- sample: `just test` that orphaned a dev server</span>
 tool_use_id   toolu_01Xk…        tool_name  Bash      cmd_digest  <span class="k">just test</span>
 started_at    …19:56:46.239      ended_at   …19:58:01.107         ok  1
 cpu_ns        <span class="k">41 203 984 112</span>    <span class="c">(41.2 CPU-seconds, exact)</span>
 cpu_ns_sampled 40 871 220 043    <span class="c">(sampler agrees to 0.8%)</span>
 peak_footprint 1 987 244 032     <span class="c">(1.99 GB — the test run's high-water mark)</span>
 disk_read     812 450 816        disk_write  104 857 600
-proc_count    17                 leaked_count  <span class="k">1</span>   <span class="c">← node dev-server left behind</span></div>
+proc_count    17                 orphaned_count  <span class="k">1</span>   <span class="c">← node dev-server left behind</span></div>
 
 <!-- ============================================================ -->
 <h2><code>agent_span</code> — fact, one row per subagent lifetime</h2>
@@ -201,7 +201,7 @@ started_at   …19:56:40.112    ended_at    …19:57:12.884   end_reason  stop</
 <tr><td class="f">attribution</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>span</code> = confident · <code>session</code> = concurrent spans made per-tool attribution ambiguous; honesty over guessing</td></tr>
 <tr><td class="f">orphaned</td><td class="t">BOOL</td><td><span class="src s-samp">sampler</span></td><td>Still alive at span close and not an allowlisted long-lived helper</td></tr>
 </tbody></table></div>
-<div class="sample"><span class="c">-- sample: the leak inside the span above</span>
+<div class="sample"><span class="c">-- sample: the orphan inside the span above</span>
 pid    84112   ppid  84066   depth  2      comm  <span class="k">node</span>
 cpu_user_ns  2 891 004 517   cpu_sys_ns  512 883 021
 peak_footprint  1 204 811 776   <span class="c">(1.2 GB)</span>

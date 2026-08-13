@@ -37,7 +37,7 @@ pub struct SpanRecord {
     pub disk_read: u64,
     pub disk_write: u64,
     pub proc_count: u32,
-    pub leaked_count: u32,
+    pub orphaned_count: u32,
 }
 
 pub struct ProcRecord {
@@ -111,7 +111,7 @@ pub struct RecentSpanRow {
     pub cpu_ns: u64,
     pub peak_footprint: u64,
     pub ok: Option<bool>,
-    pub leaked_count: i32,
+    pub orphaned_count: i32,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
 }
@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS tool_span (
   disk_read INTEGER,
   disk_write INTEGER,
   proc_count INTEGER,
-  leaked_count INTEGER
+  orphaned_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_span_session ON tool_span(session_id, started_at);
 CREATE TABLE IF NOT EXISTS proc_stat (
@@ -248,6 +248,29 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_agent_id {
         conn.execute("ALTER TABLE llm_usage ADD COLUMN agent_id TEXT", [])?;
     }
+    // "leaked" read like a credential-leak security event; the accurate term
+    // is "orphaned" (a process that outlived its tool call/session — see the
+    // `orphan` finding kind). Renamed 2026-08: guard on the old column name
+    // so this is a no-op on both fresh dbs (SCHEMA already has the new name)
+    // and already-migrated ones.
+    let has_leaked_count = {
+        let mut stmt = conn.prepare("PRAGMA table_info(tool_span)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for n in names {
+            if n? == "leaked_count" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if has_leaked_count {
+        conn.execute(
+            "ALTER TABLE tool_span RENAME COLUMN leaked_count TO orphaned_count",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -338,7 +361,7 @@ impl Store {
         tx.execute(
             "INSERT INTO tool_span(session_id, tool_use_id, agent_id, agent_type, tool_name,
                cmd_digest, started_at, ended_at, ok, cpu_ns, cpu_ns_sampled, peak_footprint,
-               disk_read, disk_write, proc_count, leaked_count)
+               disk_read, disk_write, proc_count, orphaned_count)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 span.session_id,
@@ -356,7 +379,7 @@ impl Store {
                 span.disk_read as i64,
                 span.disk_write as i64,
                 span.proc_count,
-                span.leaked_count,
+                span.orphaned_count,
             ],
         )?;
         let span_id = tx.last_insert_rowid();
@@ -519,7 +542,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT session_id, id, tool_name, cmd_digest, started_at, ended_at, ok,
-                    COALESCE(cpu_ns, cpu_ns_sampled), peak_footprint, leaked_count,
+                    COALESCE(cpu_ns, cpu_ns_sampled), peak_footprint, orphaned_count,
                     agent_id, agent_type
              FROM (
                SELECT *, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ended_at DESC) rn
@@ -539,7 +562,7 @@ impl Store {
                     ok: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
                     cpu_ns: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
                     peak_footprint: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64,
-                    leaked_count: r.get::<_, Option<i64>>(9)?.unwrap_or(0) as i32,
+                    orphaned_count: r.get::<_, Option<i64>>(9)?.unwrap_or(0) as i32,
                     agent_id: r.get(10)?,
                     agent_type: r.get(11)?,
                 },
@@ -811,7 +834,7 @@ mod tests {
                     disk_read: 0,
                     disk_write: 0,
                     proc_count: 3,
-                    leaked_count: 1,
+                    orphaned_count: 1,
                 },
                 &[ProcRecord {
                     pid: 999,
@@ -835,13 +858,13 @@ mod tests {
         assert!(span_id > 0);
         let rows = s
             .query_json(
-                "SELECT tool_name, proc_count, leaked_count FROM tool_span WHERE session_id='sess1'",
+                "SELECT tool_name, proc_count, orphaned_count FROM tool_span WHERE session_id='sess1'",
                 &[],
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tool_name"], "Bash");
-        assert_eq!(rows[0]["leaked_count"], 1);
+        assert_eq!(rows[0]["orphaned_count"], 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -878,6 +901,83 @@ mod tests {
             .unwrap();
         assert_eq!(t.input_tokens, 10);
         assert_eq!(t.output_tokens, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leaked_count_column_is_renamed_and_idempotent() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-leak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            // Build a db with the OLD schema shape (leaked_count) by hand,
+            // simulating an install that predates the rename.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tool_span (
+                   id INTEGER PRIMARY KEY,
+                   session_id TEXT,
+                   tool_use_id TEXT,
+                   agent_id TEXT,
+                   agent_type TEXT,
+                   tool_name TEXT NOT NULL,
+                   cmd_digest TEXT,
+                   started_at INTEGER NOT NULL,
+                   ended_at INTEGER,
+                   ok INTEGER,
+                   cpu_ns INTEGER,
+                   cpu_ns_sampled INTEGER,
+                   peak_footprint INTEGER,
+                   disk_read INTEGER,
+                   disk_write INTEGER,
+                   proc_count INTEGER,
+                   leaked_count INTEGER
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tool_span(session_id, tool_use_id, tool_name, started_at, ended_at, \
+                 proc_count, leaked_count) VALUES ('s1','tu1','Bash',1000,2000,3,2)",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopening through Store::open runs SCHEMA (CREATE TABLE IF NOT
+        // EXISTS — no-op on the existing table) then migrate(), which must
+        // detect leaked_count and rename it, preserving the row.
+        let s = Store::open(&db).unwrap();
+        let rows = s
+            .query_json(
+                "SELECT tool_name, proc_count, orphaned_count FROM tool_span WHERE session_id='s1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tool_name"], "Bash");
+        assert_eq!(rows[0]["proc_count"], 3);
+        assert_eq!(rows[0]["orphaned_count"], 2);
+        drop(s);
+
+        // Reopening again (already-migrated db) must be a harmless no-op:
+        // same data, no error, leaked_count stays gone.
+        let s2 = Store::open(&db).unwrap();
+        let cols: Vec<String> = {
+            let conn = s2.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(tool_span)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(!cols.iter().any(|c| c == "leaked_count"));
+        assert!(cols.iter().any(|c| c == "orphaned_count"));
+        let rows2 = s2
+            .query_json(
+                "SELECT orphaned_count FROM tool_span WHERE session_id='s1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows2[0]["orphaned_count"], 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
