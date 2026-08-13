@@ -302,6 +302,27 @@ fn is_env_assignment(tok: &str) -> bool {
     first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Per-wrapper table of short flags that take their value as the *next*
+/// token (`xargs -P 4`, `env -u PATH`), as opposed to either taking no
+/// value or an attached value (`stdbuf -oL`, which needs no entry here —
+/// it's a single token already, not a separate `-o` `L` pair). Matched
+/// against the exact flag token, so `-P4`/`-uPATH` (attached forms) don't
+/// hit this table and are just skipped as ordinary flags, unchanged.
+fn flag_takes_arg(head_base: &str, flag: &str) -> bool {
+    matches!(
+        (head_base, flag),
+        (
+            "xargs",
+            "-P" | "-n" | "-L" | "-s" | "-I" | "-E" | "-a" | "-d"
+        ) | ("env", "-u" | "-S" | "-C" | "-P")
+            | ("sudo", "-u" | "-g" | "-p" | "-h")
+            | ("nice", "-n")
+            | ("timeout", "-k" | "-s")
+            | ("caffeinate", "-t" | "-w")
+            | ("stdbuf", "-o" | "-e" | "-i")
+    )
+}
+
 /// Recursively unwrap wrapper commands (`nix-shell --run`, `sh -c`, `sudo`,
 /// `timeout`, `env`, ...) down to the innermost real command line. Returns
 /// the unwrapped command as a plain (space-joined, quote-stripped) string
@@ -387,11 +408,7 @@ fn unwrap_wrappers(command: &str, depth: u32) -> String {
                 continue;
             }
             if t.starts_with('-') {
-                // Obvious flag-with-numeric-arg cases: `nice -n 10`,
-                // `sudo -u user`.
-                let consumes_arg = (head_base == "nice" && t == "-n")
-                    || (head_base == "sudo" && (t == "-u" || t == "-g"))
-                    || (head_base == "timeout" && (t == "-k" || t == "-s"));
+                let consumes_arg = flag_takes_arg(head_base, t);
                 j += 1;
                 if consumes_arg && tokens.get(j).is_some_and(|a| !a.starts_with('-')) {
                     j += 1;
@@ -1102,6 +1119,33 @@ mod tests {
         assert_eq!(cmd_digest("xargs rustfmt"), "rustfmt");
         assert_eq!(cmd_digest("xargs -0 rustfmt"), "rustfmt");
         assert_eq!(cmd_digest("xargs"), "xargs");
+    }
+
+    #[test]
+    fn digest_handles_value_taking_flags_separately() {
+        // Regression: a separate-token flag argument (e.g. xargs's `-P 4`)
+        // must not be mistaken for the wrapped command itself.
+        assert_eq!(cmd_digest("xargs -P 4 cargo build"), "cargo build");
+        assert_eq!(cmd_digest("env -u PATH ls"), "ls");
+        assert_eq!(cmd_digest("caffeinate -t 3600 ./job.sh"), "job.sh");
+        // Other documented value-taking flags, one per wrapper.
+        assert_eq!(cmd_digest("xargs -n 1 echo"), "echo");
+        assert_eq!(cmd_digest("xargs -I {} rustfmt {}"), "rustfmt {}");
+        assert_eq!(cmd_digest("env -S '-a -b' cargo build"), "cargo build");
+        assert_eq!(cmd_digest("sudo -p prompt cargo build"), "cargo build");
+        assert_eq!(cmd_digest("timeout -k 5 30 cargo test"), "cargo test");
+        assert_eq!(cmd_digest("stdbuf -o L cargo build"), "cargo build");
+        // Attached-value forms still work unchanged (single token, no
+        // separate-arg consumption needed).
+        assert_eq!(cmd_digest("stdbuf -oL cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn digest_value_taking_flag_with_nothing_after_falls_back_gracefully() {
+        // `xargs -P` with no argument and no command: no panic, sensible
+        // fallback to the wrapper's own name.
+        assert_eq!(cmd_digest("xargs -P"), "xargs");
+        assert_eq!(cmd_digest("env -u"), "env");
     }
 
     #[test]
