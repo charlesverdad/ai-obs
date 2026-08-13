@@ -168,7 +168,7 @@ proc_count    17                 leaked_count  <span class="k">1</span>   <span 
 
 <!-- ============================================================ -->
 <h2><code>agent_span</code> — fact, one row per subagent lifetime</h2>
-<p class="tsub">The subagent's own timeline, distinct from the tool_span rows it spawns inside it. Opened by SubagentStart, closed by SubagentStop — or swept closed at SessionEnd (abnormal termination) if Stop never arrived. Draws the agent lane in the replay gantt and the TIME column in <code>top</code>'s agent rows.</p>
+<p class="tsub">The subagent's own timeline, distinct from the tool_span rows it spawns inside it. Opened by SubagentStart, closed by SubagentStop — or swept closed at SessionEnd (abnormal termination), or by a periodic staleness sweep (daemon crashed and the session was never resumed) if neither ever arrived. Never closed on daemon startup: sessions survive restarts and a subagent may legitimately still be running. Draws the agent lane in the replay gantt and the TIME column in <code>top</code>'s agent rows.</p>
 <div class="scroll"><table>
 <thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
 <tbody>
@@ -177,8 +177,8 @@ proc_count    17                 leaked_count  <span class="k">1</span>   <span 
 <tr><td class="f">agent_id</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>Same id PreToolUse/PostToolUse carry for calls made inside this agent — the join key to tool_span</td></tr>
 <tr><td class="f">agent_type</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>The agent's frontmatter name, e.g. <code>Explore</code>, <code>general-purpose</code></td></tr>
 <tr><td class="f">started_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>SubagentStart. A redelivered Start for the same agent_id is ignored — first write wins (UNIQUE(session_id, agent_id))</td></tr>
-<tr><td class="f">ended_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>SubagentStop, or the SessionEnd sweep if Stop never fired. Only ever set once — a later close never overwrites an earlier one</td></tr>
-<tr><td class="f">end_reason</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>stop</code> = normal SubagentStop · <code>session_end</code> = closed by the SessionEnd sweep · <code>daemon_restart</code> reserved, not yet swept on startup</td></tr>
+<tr><td class="f">ended_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>SubagentStop, the SessionEnd sweep, or the stale sweep. Only ever set once — a later close never overwrites an earlier one</td></tr>
+<tr><td class="f">end_reason</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>stop</code> = normal SubagentStop · <code>session_end</code> = closed by the SessionEnd sweep · <code>stale</code> = still open 24h after started_at, closed by the detector loop's periodic sweep</td></tr>
 </tbody></table></div>
 <div class="sample"><span class="c">-- sample</span>
 agent_id     a1e2c9f0-…       agent_type  Explore

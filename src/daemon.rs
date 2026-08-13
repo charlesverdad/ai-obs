@@ -178,10 +178,30 @@ async fn sampler_loop(state: AppState) {
     }
 }
 
+/// Agent spans open longer than this with no `SubagentStop`/`SessionEnd`
+/// are assumed abandoned (daemon crash mid-session, session never
+/// resumed) and swept closed with `end_reason = "stale"`.
+const STALE_AGENT_SPAN_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
 async fn detector_loop(state: AppState) {
+    let mut last_stale_sweep = 0i64;
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let now = now_ms();
+        // Piggyback on this loop's 10s cadence but only actually sweep once
+        // a minute — closing a handful of hours-old rows doesn't need to
+        // run every tick, and the UPDATE is a full-table scan.
+        if now - last_stale_sweep >= 60_000 {
+            last_stale_sweep = now;
+            match state
+                .store
+                .close_stale_agent_spans(STALE_AGENT_SPAN_MAX_AGE_MS)
+            {
+                Ok(n) if n > 0 => tracing::info!("swept {n} stale agent_span row(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("close_stale_agent_spans failed: {e:#}"),
+            }
+        }
         let procs = tokio::task::spawn_blocking(snapshot_map)
             .await
             .unwrap_or_default();

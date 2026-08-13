@@ -871,6 +871,14 @@
   // that agent's own tool_span rows nested beneath, indented; spans from
   // the main agent (agent_id == null) render as top-level rows exactly as
   // when there are no agent_spans at all.
+  //
+  // A tool_span's agent_id can exist with no matching agent_spans row —
+  // e.g. a session that straddles the upgrade (spans written before
+  // agent_span existed), or a subagent whose SubagentStart hook never
+  // reached the daemon. Those spans must still render, so any such agent_id
+  // gets a synthetic lane built from the span timestamps themselves (min
+  // started_at .. max ended_at, unlabeled end_reason) rather than being
+  // dropped.
   function renderGantt(spans, agentSpans, sessionStart, durationS) {
     const el = document.getElementById('gantt');
     const durMs = Math.max(1, durationS * 1000);
@@ -896,9 +904,28 @@
       const blocks = mainSpans.map((g) => ({ t: g.started_at, html: spanRowHtml(g, sessionStart, durMs, false) }));
       for (const a of agentSpans) {
         const children = (byAgent.get(a.agent_id) || []).sort((x, y) => x.started_at - y.started_at);
+        byAgent.delete(a.agent_id);
         const html = agentLaneHtml(a, sessionStart, durMs)
           + children.map((g) => spanRowHtml(g, sessionStart, durMs, true)).join('');
         blocks.push({ t: a.started_at, html });
+      }
+      // Leftover agent_ids with no agent_span row: synthesize a lane from
+      // the spans' own timestamps so nothing gets silently dropped.
+      for (const [agentId, children] of byAgent) {
+        children.sort((x, y) => x.started_at - y.started_at);
+        const agentType = (children.find((c) => c.agent_type) || {}).agent_type;
+        const startedAts = children.map((c) => c.started_at);
+        const endedAts = children.map((c) => c.ended_at);
+        const synthetic = {
+          agent_id: agentId,
+          agent_type: agentType,
+          started_at: Math.min(...startedAts),
+          ended_at: endedAts.every((e) => e != null) ? Math.max(...endedAts) : null,
+          end_reason: null,
+        };
+        const html = agentLaneHtml(synthetic, sessionStart, durMs)
+          + children.map((g) => spanRowHtml(g, sessionStart, durMs, true)).join('');
+        blocks.push({ t: synthetic.started_at, html });
       }
       blocks.sort((x, y) => x.t - y.t);
       html = blocks.map((b) => b.html).join('');

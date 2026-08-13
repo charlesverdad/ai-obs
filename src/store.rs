@@ -205,10 +205,15 @@ CREATE TABLE IF NOT EXISTS finding (
 CREATE INDEX IF NOT EXISTS idx_llm_ts ON llm_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_span_started ON tool_span(started_at);
 -- Subagent lifetime, opened on SubagentStart and closed on SubagentStop (or
--- swept closed by session end / daemon restart — see end_reason). A single
+-- swept closed by session end / staleness — see end_reason). A single
 -- agent_id can only be open once per session: the UNIQUE constraint backs
 -- the idempotent open/close semantics in Store::open_agent_span /
 -- close_agent_span (see their docs for the exact duplicate-event policy).
+-- Sessions survive daemon restarts and subagents may legitimately still be
+-- running, so nothing is closed at daemon startup; the only backstops are
+-- SessionEnd ('session_end') and the detector loop's stale sweep ('stale',
+-- Store::close_stale_agent_spans) for rows open far longer than any real
+-- subagent run.
 CREATE TABLE IF NOT EXISTS agent_span (
   id INTEGER PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES session(id),
@@ -216,7 +221,7 @@ CREATE TABLE IF NOT EXISTS agent_span (
   agent_type TEXT,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
-  end_reason TEXT CHECK(end_reason IN ('stop','session_end','daemon_restart') OR end_reason IS NULL),
+  end_reason TEXT CHECK(end_reason IN ('stop','session_end','stale') OR end_reason IS NULL),
   UNIQUE(session_id, agent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_span_session ON agent_span(session_id, started_at);
@@ -591,9 +596,13 @@ impl Store {
 
     /// Close every still-open agent span for a session — used at
     /// `SessionEnd` (`end_reason = "session_end"`) to cover subagents whose
-    /// `SubagentStop` never arrived (abnormal termination), and can also be
-    /// used at daemon startup (`end_reason = "daemon_restart"`) to close
-    /// spans orphaned by a previous crash/restart.
+    /// `SubagentStop` never arrived (abnormal termination). Deliberately
+    /// *not* called at daemon startup: sessions survive daemon restarts and
+    /// a subagent may legitimately still be running when the daemon comes
+    /// back up. The other backstop — spans that outlive both `SubagentStop`
+    /// and `SessionEnd` (e.g. the daemon crashes and the session is never
+    /// resumed) — is [`Store::close_stale_agent_spans`], run periodically
+    /// from the detector loop.
     pub fn close_all_open_agent_spans_for_session(
         &self,
         session_id: &str,
@@ -606,6 +615,25 @@ impl Store {
             params![session_id, now_ms(), end_reason],
         )?;
         Ok(())
+    }
+
+    /// Close every still-open agent span across *all* sessions whose
+    /// `started_at` is older than `max_age_ms` (`end_reason = "stale"`).
+    /// The backstop for spans that outlive both `SubagentStop` and
+    /// `SessionEnd` — e.g. the daemon crashes mid-session and the session
+    /// is never resumed, so neither hook ever fires. Returns the number of
+    /// rows closed. Intended to be called periodically (see the detector
+    /// loop in daemon.rs), not at daemon startup — see the schema comment
+    /// on `agent_span` for why.
+    pub fn close_stale_agent_spans(&self, max_age_ms: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now_ms() - max_age_ms;
+        let n = conn.execute(
+            "UPDATE agent_span SET ended_at = ?1, end_reason = 'stale'
+             WHERE ended_at IS NULL AND started_at < ?2",
+            params![now_ms(), cutoff],
+        )?;
+        Ok(n)
     }
 
     /// All `agent_span` rows for one session, oldest first — feeds the
@@ -989,6 +1017,50 @@ mod tests {
             times[&("s1".to_string(), "agentB".to_string())],
             (3000, None)
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn close_stale_agent_spans_closes_only_old_open_ones() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+
+        let day_ms: i64 = 24 * 60 * 60 * 1000;
+        let now = now_ms();
+        // Open 25h ago: older than the 24h threshold -> should be swept.
+        s.open_agent_span("s1", "stale-agent", Some("Explore"), now - day_ms - 60_000)
+            .unwrap();
+        // Open 1h ago: well within the threshold -> must stay untouched.
+        s.open_agent_span("s1", "fresh-agent", Some("Explore"), now - 60 * 60 * 1000)
+            .unwrap();
+        // Already closed, opened 2 days ago: must not be touched or
+        // reported as swept (ended_at IS NULL is required).
+        s.open_agent_span("s1", "closed-agent", Some("Explore"), now - 2 * day_ms)
+            .unwrap();
+        s.close_agent_span("s1", "closed-agent", now - day_ms, "stop")
+            .unwrap();
+
+        let n = s.close_stale_agent_spans(day_ms).unwrap();
+        assert_eq!(n, 1);
+
+        let mut spans = s.agent_spans_for_session("s1").unwrap();
+        spans.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        let stale = spans.iter().find(|r| r.agent_id == "stale-agent").unwrap();
+        assert!(stale.ended_at.is_some());
+        assert_eq!(stale.end_reason.as_deref(), Some("stale"));
+        let fresh = spans.iter().find(|r| r.agent_id == "fresh-agent").unwrap();
+        assert!(fresh.ended_at.is_none());
+        let closed = spans.iter().find(|r| r.agent_id == "closed-agent").unwrap();
+        assert_eq!(closed.end_reason.as_deref(), Some("stop")); // untouched
+
+        // Idempotent: running again finds nothing left to sweep.
+        let n2 = s.close_stale_agent_spans(day_ms).unwrap();
+        assert_eq!(n2, 0);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
