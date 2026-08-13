@@ -769,12 +769,24 @@
     renderCompare(data.medians);
   }
 
+  // Only https?:// URLs are allowed through as an href — anything else
+  // (javascript:, data:, vbscript:, …) collapses to '#' so a poisoned
+  // pr_url can't execute script when clicked.
+  const escUrl = (u) => /^https?:\/\//i.test(u) ? esc(u) : '#';
+
   function renderFacts(f) {
+    // [key, value, isHtml]. Every server-sourced string here (project,
+    // project_root, branch, cc_version, end_reason, …) is untrusted — e.g. a
+    // git branch name is attacker-controllable and can contain
+    // `<img onerror=...>` — so isHtml defaults to false and esc() runs on
+    // every value except the one row that's deliberately built as markup.
     const rows = [
       ['project', f.project || '?'],
       ['root', f.project_root || '—'],
       ['branch', f.branch || '—'],
-      ['pr', f.pr_url ? `<a href="${esc(f.pr_url)}" target="_blank" rel="noopener">#${f.pr_number}</a>` : (f.pr_number ? '#' + f.pr_number : '—')],
+      ['pr', f.pr_url
+        ? [`<a href="${escUrl(f.pr_url)}" target="_blank" rel="noopener">#${esc(f.pr_number)}</a>`, true]
+        : (f.pr_number ? '#' + f.pr_number : '—')],
       ['claude pid', f.claude_pid != null ? f.claude_pid : '—'],
       ['cc version', f.cc_version || '—'],
       ['end reason', f.end_reason || (f.ended_at ? '—' : 'running')],
@@ -785,7 +797,10 @@
     return `
       <div style="display:flex;flex-direction:column;gap:9px">
         <div class="section-title">SESSION</div>
-        ${rows.map(([k, v]) => `<div class="fact-row"><span class="fact-k">${esc(k)}</span><span class="fact-v">${v}</span></div>`).join('')}
+        ${rows.map(([k, v]) => {
+          const [val, isHtml] = Array.isArray(v) ? v : [v, false];
+          return `<div class="fact-row"><span class="fact-k">${esc(k)}</span><span class="fact-v">${isHtml ? val : esc(val)}</span></div>`;
+        }).join('')}
       </div>`;
   }
 

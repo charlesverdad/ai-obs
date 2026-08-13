@@ -2,9 +2,10 @@
 
 use crate::correlator::{snapshot_map, Correlator, Session, Span};
 use crate::store::{now_ms, AgentSpanTimes, RecentSpanRow, Store, TokenTotals};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -44,6 +45,43 @@ pub fn port() -> u16 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT)
+}
+
+/// The exact `Host` header values a same-origin request to this daemon can
+/// carry. Anything else — including a DNS name that some malicious page
+/// got a browser to resolve to 127.0.0.1 (DNS rebinding) — is rejected by
+/// [`host_guard`].
+fn allowed_hosts(port: u16) -> [String; 3] {
+    [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]
+}
+
+/// Pure predicate behind [`host_guard`] — split out so it's unit-testable
+/// without spinning up axum's middleware/service machinery.
+fn host_is_allowed(host_header: Option<&str>, port: u16) -> bool {
+    match host_header {
+        Some(h) => allowed_hosts(port).iter().any(|a| a == h),
+        None => false,
+    }
+}
+
+/// Axum middleware, applied to the whole router: 421 Misdirected Request
+/// for anything whose `Host` header isn't exactly one of [`allowed_hosts`].
+/// Defends against DNS rebinding — without this, a page open in the
+/// user's browser could point a hostname at 127.0.0.1 and the daemon would
+/// treat the request as legitimate same-origin traffic.
+async fn host_guard(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if !host_is_allowed(host, port()) {
+        return (StatusCode::MISDIRECTED_REQUEST, "bad host").into_response();
+    }
+    next.run(req).await
 }
 
 #[derive(Clone)]
@@ -123,7 +161,14 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         .route("/api/top", get(api_top))
         .route("/api/history", get(api_history))
         .route("/api/session/{id}", get(api_session))
-        .with_state(state);
+        .with_state(state)
+        // Applied to every route (hooks, API, dashboard): rejects any
+        // request whose Host header isn't one of our own bound addresses,
+        // so a malicious page a browser visits can't DNS-rebind to
+        // 127.0.0.1 and hit the daemon as if it were same-origin. Hook
+        // curl commands and the local client (client.rs) all target
+        // 127.0.0.1:{port} directly, so this never affects them.
+        .layer(middleware::from_fn(host_guard));
 
     let addr = format!("127.0.0.1:{}", port());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -787,8 +832,21 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
 
 // ---------------- historical dashboard ----------------
 
-async fn dashboard_html() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
+/// The dashboard is one self-contained HTML file — inline `<script>`,
+/// inline `style=` attributes, `fetch()` to same-origin `/api/*` and
+/// nothing else (no images, fonts, or external resources) — so this CSP is
+/// as tight as `'unsafe-inline'` allows: deny everything by default, then
+/// allow exactly the three things the page actually uses.
+const DASHBOARD_CSP: &str =
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'";
+
+async fn dashboard_html() -> Response {
+    let mut resp = Html(include_str!("dashboard.html")).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(DASHBOARD_CSP),
+    );
+    resp
 }
 
 #[derive(Deserialize)]
@@ -852,4 +910,35 @@ fn db_info(db_path: &std::path::Path) -> (String, f64) {
         .map(|m| (m.len() as f64 / 1_000_000.0 * 10.0).round() / 10.0)
         .unwrap_or(0.0);
     (db_path.display().to_string(), size_mb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_guard_accepts_our_own_bound_addresses() {
+        for h in ["127.0.0.1:8770", "localhost:8770", "[::1]:8770"] {
+            assert!(host_is_allowed(Some(h), 8770), "expected {h} to pass");
+        }
+    }
+
+    #[test]
+    fn host_guard_rejects_dns_rebinding_and_missing_host() {
+        // A hostname an attacker controls DNS for, resolving to 127.0.0.1 —
+        // exactly the DNS-rebinding shape this guard exists to stop.
+        assert!(!host_is_allowed(Some("evil.example.com:8770"), 8770));
+        // Right host, wrong port (e.g. probing another local service).
+        assert!(!host_is_allowed(Some("127.0.0.1:9999"), 8770));
+        // Port smuggled into the host string / IPv6 without brackets.
+        assert!(!host_is_allowed(Some("127.0.0.1"), 8770));
+        assert!(!host_is_allowed(Some("::1:8770"), 8770));
+        assert!(!host_is_allowed(None, 8770));
+    }
+
+    #[test]
+    fn host_guard_is_scoped_to_the_configured_port() {
+        assert!(host_is_allowed(Some("127.0.0.1:18771"), 18771));
+        assert!(!host_is_allowed(Some("127.0.0.1:18771"), 8770));
+    }
 }
