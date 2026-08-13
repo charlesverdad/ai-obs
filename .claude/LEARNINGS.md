@@ -45,3 +45,9 @@ and load-bearing — this is not a changelog.
   rolls up reaped grandchildren recursively), plus any still-live direct
   shell children. Sessions started before hook install have no claude_pid
   (SessionStart never fired) → spans record with sampled CPU only.
+
+- **Redeploying the daemon binary**: never `cp` over `~/.local/bin/ai-obs` in
+  place — overwriting the running/registered binary's inode invalidates its
+  code signature and launchd refuses to respawn it ("spawn scheduled" forever).
+  Always `cp` to a temp name then `mv -f` (new inode), then
+  `launchctl kickstart -k gui/$UID/dev.ai-obs.daemon`.
