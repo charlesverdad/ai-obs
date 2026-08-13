@@ -1,0 +1,269 @@
+<title>ai-obs Data Dictionary</title>
+<style>
+:root{
+  --ground:#F3F5F3; --surface:#FFFFFF; --surface-2:#E9EDEB; --ink:#141B1E;
+  --ink-2:#3D4A4E; --muted:#66787D; --rule:#D2DAD7; --rule-soft:#E2E8E5;
+  --accent:#0E6C76; --accent-soft:#D6E9EA; --ok:#2F6E4A; --warn:#96650B;
+  --crit:#9E3223; --ok-bg:#DFEBE2; --warn-bg:#F3E7CC; --crit-bg:#F3DCD8;
+  --code-bg:#EDF1EF;
+  --shadow:0 1px 2px rgba(20,27,30,.06), 0 8px 24px -16px rgba(20,27,30,.28);
+  --display:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+  --body:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1416; --surface:#151D20; --surface-2:#1C262A; --ink:#E3EBEB;
+    --ink-2:#BCC9CA; --muted:#82989C; --rule:#2A373B; --rule-soft:#212D31;
+    --accent:#54C2CC; --accent-soft:#17383D; --ok:#79C295; --warn:#DCAE55;
+    --crit:#E38574; --ok-bg:#163024; --warn-bg:#33270F; --crit-bg:#3A1F1A;
+    --code-bg:#111A1D;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1416; --surface:#151D20; --surface-2:#1C262A; --ink:#E3EBEB;
+  --ink-2:#BCC9CA; --muted:#82989C; --rule:#2A373B; --rule-soft:#212D31;
+  --accent:#54C2CC; --accent-soft:#17383D; --ok:#79C295; --warn:#DCAE55;
+  --crit:#E38574; --ok-bg:#163024; --warn-bg:#33270F; --crit-bg:#3A1F1A;
+  --code-bg:#111A1D;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
+  font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1060px;margin:0 auto;padding:0 24px 96px}
+header.mast{padding:52px 0 24px;border-bottom:1px solid var(--rule);margin-bottom:8px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--accent);margin:0 0 14px;font-weight:600}
+h1{font-family:var(--display);font-weight:400;font-size:clamp(34px,5vw,50px);line-height:1.06;
+  margin:0 0 14px;letter-spacing:-.015em;text-wrap:balance}
+.standfirst{font-size:18px;color:var(--ink-2);margin:0;max-width:64ch}
+h2{font-family:var(--display);font-weight:400;font-size:27px;margin:56px 0 4px;
+  letter-spacing:-.01em;text-wrap:balance}
+h2 code{font-family:var(--mono);font-size:.78em;background:var(--accent-soft);
+  color:var(--accent);border:0;padding:2px 8px;border-radius:4px;vertical-align:2px}
+.tsub{color:var(--muted);font-size:14px;margin:0 0 16px;max-width:70ch}
+p{margin:0 0 14px;max-width:70ch}
+code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);
+  padding:1.5px 5px;border-radius:3px;border:1px solid var(--rule-soft)}
+.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:6px;
+  background:var(--surface);box-shadow:var(--shadow);margin:14px 0 10px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:640px}
+th,td{text-align:left;padding:8px 13px;border-bottom:1px solid var(--rule-soft);vertical-align:top}
+thead th{font-family:var(--mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;background:var(--surface-2);white-space:nowrap;
+  border-bottom:1px solid var(--rule)}
+tbody tr:last-child td{border-bottom:0}
+td.f{font-family:var(--mono);font-size:12px;white-space:nowrap;color:var(--ink)}
+td.t{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap}
+td.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px;white-space:nowrap}
+.src{display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:600;
+  letter-spacing:.07em;padding:1.5px 6px;border-radius:3px;text-transform:uppercase;white-space:nowrap}
+.s-hook{background:var(--accent-soft);color:var(--accent)}
+.s-samp{background:var(--ok-bg);color:var(--ok)}
+.s-tail{background:var(--warn-bg);color:var(--warn)}
+.s-comp{background:var(--surface-2);color:var(--muted)}
+.sample{background:var(--code-bg);border:1px solid var(--rule);border-radius:6px;
+  padding:13px 16px;margin:10px 0 4px;overflow-x:auto;font-family:var(--mono);
+  font-size:12px;line-height:1.7;white-space:pre}
+.sample .k{color:var(--accent)}
+.sample .c{color:var(--muted)}
+figcaption,.cap{font-family:var(--mono);font-size:11px;color:var(--muted);margin:8px 0 0;line-height:1.5}
+.note{border:1px solid var(--rule);border-left:3px solid var(--accent);background:var(--surface);
+  border-radius:0 6px 6px 0;padding:14px 18px;margin:22px 0;box-shadow:var(--shadow);max-width:74ch}
+.note p:last-child{margin-bottom:0}
+.legend{display:flex;flex-wrap:wrap;gap:10px 18px;margin:18px 0 6px;align-items:center;
+  font-size:13px;color:var(--ink-2)}
+footer{margin-top:72px;padding-top:20px;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:11px;color:var(--muted)}
+a{color:var(--accent)}
+</style>
+
+<div class="wrap">
+<header class="mast">
+  <p class="eyebrow">ai-obs · data dictionary</p>
+  <h1>What ai-obs Collects</h1>
+  <p class="standfirst">Every field the daemon persists, where it comes from, and what a real row looks like. One SQLite file, all local: <code>~/.local/share/ai-obs/ai-obs.db</code>. Nothing leaves the machine.</p>
+</header>
+
+<div class="legend">
+  <span><span class="src s-hook">hook</span> pushed by Claude Code hooks (HTTP, live)</span>
+  <span><span class="src s-samp">sampler</span> measured from the kernel (proc_pid_rusage)</span>
+  <span><span class="src s-tail">transcript</span> tailed from ~/.claude/projects/*.jsonl</span>
+  <span><span class="src s-comp">computed</span> derived by the daemon</span>
+</div>
+
+<div class="note">
+  <p><b>Privacy defaults.</b> Commands are stored as a two-word <i>digest</i> (<code>just test</code>, <code>cargo build</code>) — never the full command line with flags and paths. Environment variables are never read (the kernel forbids it unprivileged — verified, not just promised). Sample rows below are illustrative, with values taken from real measurement runs.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><code>project</code> — dimension</h2>
+<p class="tsub">One row per repository the agent has worked in. The grouping key for every view.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">id</td><td class="t">INTEGER PK</td><td><span class="src s-comp">computed</span></td><td>Surrogate key</td></tr>
+<tr><td class="f">root</td><td class="t">TEXT UNIQUE</td><td><span class="src s-hook">hook</span></td><td>Git toplevel of the session's cwd (walks up to <code>.git</code>); the cwd itself for non-repos</td></tr>
+<tr><td class="f">name</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td>Basename of root — the label shown everywhere</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample</span>
+id  root                              name
+1   /Users/charles/work/remin         remin
+2   /Users/charles/work/ai-obs        ai-obs</div>
+
+<!-- ============================================================ -->
+<h2><code>session</code> — dimension</h2>
+<p class="tsub">One row per Claude Code session. Registered by the SessionStart hook (live path) or discovered from transcripts (backfill path); both paths merge into the same row.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">id</td><td class="t">TEXT PK</td><td><span class="src s-hook">hook</span></td><td>Claude Code session UUID</td></tr>
+<tr><td class="f">project_id</td><td class="t">INTEGER FK</td><td><span class="src s-comp">computed</span></td><td>→ project</td></tr>
+<tr><td class="f">claude_pid</td><td class="t">INTEGER</td><td><span class="src s-hook">hook</span></td><td>PID of the claude process — the root of the attribution tree. Found by the SessionStart helper walking its own ancestry</td></tr>
+<tr><td class="f">git_branch</td><td class="t">TEXT</td><td><span class="src s-tail">transcript</span></td><td>Latest branch seen (sessions switch branches mid-flight; per-message branch lives in the transcript)</td></tr>
+<tr><td class="f">pr_number, pr_url</td><td class="t">INTEGER, TEXT</td><td><span class="src s-tail">transcript</span></td><td>From Claude Code's own <code>pr-link</code> records — the per-PR join</td></tr>
+<tr><td class="f">cc_version</td><td class="t">TEXT</td><td><span class="src s-tail">transcript</span></td><td>Claude Code version</td></tr>
+<tr><td class="f">started_at, ended_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>Unix ms; ended via SessionEnd hook</td></tr>
+<tr><td class="f">end_reason</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td><code>clear</code> · <code>logout</code> · <code>prompt_input_exit</code> · <code>other</code></td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample</span>
+id            9fa19110-56c0-4781-…   <span class="c">(uuid)</span>
+project_id    1                      <span class="c">→ remin</span>
+claude_pid    22673
+git_branch    fix/release-ci
+pr_number     38                     pr_url  https://github.com/…/pull/38
+started_at    1786528700437          ended_at  NULL   <span class="c">(still live)</span></div>
+
+<!-- ============================================================ -->
+<h2><code>tool_span</code> — fact, one row per tool call</h2>
+<p class="tsub">The core fact table. Opened by PreToolUse, closed by PostToolUse(-Failure); resource totals collapse into the row at close. This is what answers "what did it run and what did that cost".</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">id</td><td class="t">INTEGER PK</td><td><span class="src s-comp">computed</span></td><td></td></tr>
+<tr><td class="f">session_id</td><td class="t">TEXT FK</td><td><span class="src s-hook">hook</span></td><td>→ session</td></tr>
+<tr><td class="f">tool_use_id</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>Claude's <code>toolu_…</code> id; joins Pre to Post</td></tr>
+<tr><td class="f">agent_id, agent_type</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>Set when the call ran inside a subagent — main vs. subagent breakdowns</td></tr>
+<tr><td class="f">tool_name</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td><code>Bash</code>, <code>Edit</code>, <code>mcp__server__tool</code>, …</td></tr>
+<tr><td class="f">cmd_digest</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td>Two-word normalised shape of Bash commands; paths and flags stripped</td></tr>
+<tr><td class="f">started_at, ended_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>Span window</td></tr>
+<tr><td class="f">ok</td><td class="t">BOOL</td><td><span class="src s-hook">hook</span></td><td>false when closed by PostToolUseFailure</td></tr>
+<tr><td class="f">cpu_ns</td><td class="t">INTEGER ns</td><td><span class="src s-samp">sampler</span></td><td><b>Exact</b> CPU of everything the call spawned and reaped: child-CPU counter delta on the session's persistent shell. Catches processes too short-lived to sample</td></tr>
+<tr><td class="f">cpu_ns_sampled</td><td class="t">INTEGER ns</td><td><span class="src s-samp">sampler</span></td><td>Sum over sampled per-process CPU — the cross-check for cpu_ns</td></tr>
+<tr><td class="f">peak_footprint</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Max phys_footprint high-water mark across the span's processes (what Activity Monitor calls "memory")</td></tr>
+<tr><td class="f">disk_read, disk_write</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Bytes of real disk I/O</td></tr>
+<tr><td class="f">proc_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Distinct processes attributed to the span</td></tr>
+<tr><td class="f">leaked_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Processes still alive when the span closed (allowlisted language servers excluded) — the orphan signal</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample: `just test` that leaked a dev server</span>
+tool_use_id   toolu_01Xk…        tool_name  Bash      cmd_digest  <span class="k">just test</span>
+started_at    …19:56:46.239      ended_at   …19:58:01.107         ok  1
+cpu_ns        <span class="k">41 203 984 112</span>    <span class="c">(41.2 CPU-seconds, exact)</span>
+cpu_ns_sampled 40 871 220 043    <span class="c">(sampler agrees to 0.8%)</span>
+peak_footprint 1 987 244 032     <span class="c">(1.99 GB — the test run's high-water mark)</span>
+disk_read     812 450 816        disk_write  104 857 600
+proc_count    17                 leaked_count  <span class="k">1</span>   <span class="c">← node dev-server left behind</span></div>
+
+<!-- ============================================================ -->
+<h2><code>proc_stat</code> — fact, one row per process per span</h2>
+<p class="tsub">The drill-down under a tool span: which binaries actually did the work. Raw 10 Hz samples are never stored — they collapse to one row when the process exits or the span closes.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">span_id, session_id</td><td class="t">FK</td><td><span class="src s-comp">computed</span></td><td>Parent span and session</td></tr>
+<tr><td class="f">pid, ppid, depth</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Identity and tree position (depth below the claude process)</td></tr>
+<tr><td class="f">comm, name</td><td class="t">TEXT</td><td><span class="src s-samp">sampler</span></td><td>Kernel-reported command name (16/32 bytes). Not the argv — see privacy note</td></tr>
+<tr><td class="f">first_seen, last_seen</td><td class="t">INTEGER ms</td><td><span class="src s-samp">sampler</span></td><td>Observation window</td></tr>
+<tr><td class="f">exited</td><td class="t">BOOL</td><td><span class="src s-samp">sampler</span></td><td>Confirmed gone before span close</td></tr>
+<tr><td class="f">cpu_user_ns, cpu_sys_ns</td><td class="t">INTEGER ns</td><td><span class="src s-samp">sampler</span></td><td>Per-process CPU, timebase-corrected (the 41.67× Apple-Silicon trap lives here)</td></tr>
+<tr><td class="f">peak_footprint</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Kernel lifetime high-water mark — exact even between samples</td></tr>
+<tr><td class="f">disk_read, disk_write</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Per-process I/O</td></tr>
+<tr><td class="f">attribution</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>span</code> = confident · <code>session</code> = concurrent spans made per-tool attribution ambiguous; honesty over guessing</td></tr>
+<tr><td class="f">orphaned</td><td class="t">BOOL</td><td><span class="src s-samp">sampler</span></td><td>Still alive at span close and not an allowlisted long-lived helper</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample: the leak inside the span above</span>
+pid    84112   ppid  84066   depth  2      comm  <span class="k">node</span>
+cpu_user_ns  2 891 004 517   cpu_sys_ns  512 883 021
+peak_footprint  1 204 811 776   <span class="c">(1.2 GB)</span>
+attribution  span             orphaned  <span class="k">1</span></div>
+
+<!-- ============================================================ -->
+<h2><code>session_sample</code> — timeseries, 1 Hz</h2>
+<p class="tsub">The timeline: what each session looked like second by second. Answers "what happened at 3 am". Downsampled to 1-minute buckets after 24 h.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">session_id, t</td><td class="t">PK (TEXT, INTEGER s)</td><td><span class="src s-comp">computed</span></td><td>One row per session per second</td></tr>
+<tr><td class="f">cpu_pct</td><td class="t">REAL</td><td><span class="src s-samp">sampler</span></td><td>CPU across the whole tracked tree; 100 = one core</td></tr>
+<tr><td class="f">footprint</td><td class="t">INTEGER B</td><td><span class="src s-samp">sampler</span></td><td>Total memory footprint of the tree</td></tr>
+<tr><td class="f">proc_count</td><td class="t">INTEGER</td><td><span class="src s-samp">sampler</span></td><td>Tracked process count</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample: the leak-detector's raw material</span>
+t           cpu_pct   footprint      proc_count
+1786589820  782.4     3 104 517 120  23     <span class="c">← runaway test suite</span>
+1786589821  779.1     3 121 294 336  23
+1786589822  781.0     3 138 071 552  23     <span class="c">← +16 MB/s slope = leak signature</span></div>
+
+<!-- ============================================================ -->
+<h2><code>llm_usage</code> — fact, one row per assistant message</h2>
+<p class="tsub">The token side, tailed from transcripts (durable — survives daemon downtime and backfills history). Grouping by project/branch/PR falls out of the transcript's own metadata.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">message_uuid</td><td class="t">TEXT PK</td><td><span class="src s-tail">transcript</span></td><td>Dedup key — re-reads are idempotent</td></tr>
+<tr><td class="f">session_id, request_id, ts</td><td class="t">TEXT, TEXT, ms</td><td><span class="src s-tail">transcript</span></td><td>Provenance</td></tr>
+<tr><td class="f">model</td><td class="t">TEXT</td><td><span class="src s-tail">transcript</span></td><td>e.g. <code>claude-sonnet-5</code>, <code>claude-opus-5[1m]</code></td></tr>
+<tr><td class="f">is_sidechain</td><td class="t">BOOL</td><td><span class="src s-tail">transcript</span></td><td>true = subagent traffic — main vs. subagent spend</td></tr>
+<tr><td class="f">input_tokens, output_tokens</td><td class="t">INTEGER</td><td><span class="src s-tail">transcript</span></td><td>The four-way token split…</td></tr>
+<tr><td class="f">cache_read, cache_creation</td><td class="t">INTEGER</td><td><span class="src s-tail">transcript</span></td><td>…cache reads are 10× cheaper than input; cache writes 1.25×</td></tr>
+<tr><td class="f">cost_usd</td><td class="t">REAL nullable</td><td><span class="src s-comp">computed</span></td><td>Priced from the local model table. <b>NULL for unknown models</b> — never guessed</td></tr>
+<tr><td class="f">cost_source</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>computed</code> · <code>unknown</code> · (<code>otel</code> reserved for the OTLP receiver)</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample</span>
+message_uuid  ebde719a-…      model  claude-sonnet-5   is_sidechain  0
+input_tokens  1 204           output_tokens  8 116
+cache_read    412 093         cache_creation  18 240
+cost_usd      <span class="k">0.2367</span>          cost_source  computed
+<span class="c">-- and an honest row:</span>
+model  claude-fable-5         cost_usd  <span class="k">NULL</span>       cost_source  unknown</div>
+
+<!-- ============================================================ -->
+<h2><code>finding</code> — the detectors' output</h2>
+<p class="tsub">What the four detectors (orphan, leak, runaway-CPU, contention) raise. Log-only until thresholds are calibrated on a week of real data; never auto-kills.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">ts</td><td class="t">INTEGER ms</td><td><span class="src s-comp">computed</span></td><td>When raised</td></tr>
+<tr><td class="f">kind</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>orphan</code> · <code>memory</code> · <code>runaway</code> · <code>contention</code></td></tr>
+<tr><td class="f">severity</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>crit</code> · <code>warn</code></td></tr>
+<tr><td class="f">session_id, span_id, pid</td><td class="t">FK, FK, INTEGER</td><td><span class="src s-comp">computed</span></td><td>What it points at — enough to act on</td></tr>
+<tr><td class="f">message</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td>Human sentence with project, command, and size</td></tr>
+<tr><td class="f">resolved_at</td><td class="t">INTEGER ms</td><td><span class="src s-comp">computed</span></td><td>Set when the process exits or the operator acts</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample: the exact failure mode that motivated this project</span>
+kind  <span class="k">orphan</span>   severity  crit   pid  3074
+message  "sh (pid 3074) from `sh -c` in chime outlived its tool
+          call by 60s+, 1 MB"   <span class="c">← 8 of these burned 56 CPU-hours overnight</span></div>
+
+<!-- ============================================================ -->
+<h2><code>tailer_checkpoint</code> — bookkeeping</h2>
+<p class="tsub">Byte offset per transcript file, so a daemon restart resumes instead of re-reading 495 project directories. Offsets only advance past complete lines; a partially-written line is retried next poll.</p>
+<div class="sample">path    /Users/charles/.claude/projects/-Users-…-remin/9fa19110-….jsonl
+offset  48 211 904</div>
+
+<!-- ============================================================ -->
+<h2>Retention</h2>
+<div class="scroll"><table>
+<thead><tr><th>data</th><th>kept</th><th>why</th></tr></thead>
+<tbody>
+<tr><td>Raw 10 Hz samples</td><td class="num">never persisted</td><td>2.6 GB/day if stored; collapsed in memory instead</td></tr>
+<tr><td><code>session_sample</code> (1 Hz)</td><td class="num">24 h, then 1-min buckets</td><td>Timeline stays useful, size stays bounded</td></tr>
+<tr><td><code>proc_stat</code> below noise floor</td><td class="num">7 days</td><td>Tiny processes stop mattering quickly</td></tr>
+<tr><td><code>tool_span</code>, <code>llm_usage</code>, <code>finding</code></td><td class="num">indefinite</td><td>Small rows; the long-term record per project and PR</td></tr>
+</tbody></table></div>
+<p class="cap">Working size on one active machine: a few MB per day. All figures configurable.</p>
+
+<footer>ai-obs data dictionary · schema v1 · 13 Aug 2026 · companion to the <a href="ai-obs-design.html">design doc</a></footer>
+</div>
