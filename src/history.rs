@@ -75,16 +75,20 @@ fn round2(x: f64) -> f64 {
 /// "running", regardless of how old `started_at` is.
 const RUNNING_GRACE_MS: i64 = 10 * 60 * 1000;
 
-/// Derive a display status + duration for a session whose `end_reason` may
-/// be NULL. `last_activity_ms` is `MAX(started_at, last tool_span activity,
-/// last llm_usage activity)` — never a bare `now`, so a session that never
-/// got a `SessionEnd` doesn't read as perpetually "running".
+/// Derive a display status + duration for a session whose `end_reason`
+/// and/or `ended_at` may be NULL. `last_activity_ms` is `MAX(started_at,
+/// last tool_span activity, last llm_usage activity)` — never a bare `now`,
+/// so a session that never got a `SessionEnd` doesn't read as perpetually
+/// "running".
 ///
-/// - `end_reason` present -> that status, duration = ended_at - started_at
-///   (today's behavior, unchanged).
-/// - `end_reason` NULL and recently active (within `RUNNING_GRACE_MS` of
+/// - `ended_at` present -> status = `end_reason` if set, else "ended";
+///   duration = ended_at - started_at. This wins regardless of whether
+///   `end_reason` was captured, since `ended_at` alone is the authoritative
+///   "this session is over" signal (`end_session` always sets it on
+///   SessionEnd; `end_reason` capture is a separate, less reliable path).
+/// - `ended_at` NULL and recently active (within `RUNNING_GRACE_MS` of
 ///   `now`) -> "running", duration = now - started_at.
-/// - `end_reason` NULL and stale -> "inactive", duration = last_activity_ms
+/// - `ended_at` NULL and stale -> "inactive", duration = last_activity_ms
 ///   - started_at (never start -> now).
 fn derive_status(
     end_reason: Option<&str>,
@@ -93,9 +97,17 @@ fn derive_status(
     last_activity_ms: i64,
     now: i64,
 ) -> (String, i64) {
-    if let Some(reason) = end_reason {
-        let duration_s = (ended_at.unwrap_or(now) - started_at) / 1000;
-        return (reason.to_string(), duration_s.max(0));
+    // A session's `ended_at` is the authoritative signal that it's over —
+    // it's set (by `end_session`) whenever a SessionEnd hook lands,
+    // independent of whether `end_reason` was captured. Sessions that
+    // received SessionEnd before the h_end "reason"-field fix have
+    // `ended_at` set with `end_reason` NULL; treating those as
+    // running/inactive (keyed only on `end_reason`) discards a real end
+    // timestamp in favor of guessing from activity. So `ended_at` presence
+    // always wins, with "ended" as the status when no reason was recorded.
+    if let Some(ended) = ended_at {
+        let duration_s = (ended - started_at) / 1000;
+        return (end_reason.unwrap_or("ended").to_string(), duration_s.max(0));
     }
     if now - last_activity_ms <= RUNNING_GRACE_MS {
         ("running".to_string(), ((now - started_at) / 1000).max(0))
@@ -827,6 +839,23 @@ mod tests {
             derive_status(Some("clear"), Some(10_000), 1_000, 5_000, 999_999);
         assert_eq!(status, "clear");
         assert_eq!(duration_s, 9); // (10_000 - 1_000)/1000, independent of "now"
+    }
+
+    #[test]
+    fn derive_status_ended_at_set_with_null_end_reason_is_ended_not_running() {
+        // Sessions that received SessionEnd before the h_end "reason"-field
+        // fix landed have ended_at set but end_reason NULL. ended_at must
+        // still win over the running/inactive activity-based guess, using
+        // its real end timestamp for duration rather than last_activity_ms
+        // or `now`.
+        let started_at = 1_000_i64;
+        let ended_at = 61_000_i64;
+        let last_activity_ms = 50_000_i64; // would otherwise suggest "inactive"
+        let now = 10_000_000_i64; // would otherwise suggest neither running nor inactive is close
+        let (status, duration_s) =
+            derive_status(None, Some(ended_at), started_at, last_activity_ms, now);
+        assert_eq!(status, "ended");
+        assert_eq!(duration_s, (ended_at - started_at) / 1000);
     }
 
     #[test]

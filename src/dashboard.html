@@ -804,7 +804,11 @@
         : (f.pr_number ? '#' + f.pr_number : '—')],
       ['claude pid', f.claude_pid != null ? f.claude_pid : '—'],
       ['cc version', f.cc_version || '—'],
-      ['end reason', f.end_reason || (f.status === 'running' ? 'running' : 'inactive (no end event recorded)')],
+      ['end reason', f.end_reason || (
+        f.status === 'running' ? 'running'
+        : f.status === 'ended' ? 'ended (no reason recorded)'
+        : 'inactive (no end event recorded)'
+      )],
       ['calls', f.calls],
       ['tokens', `${fmtCompact(f.tokens_in)} in · ${fmtCompact(f.tokens_out)} out · ${fmtCompact(f.cache_read)} cache`],
       ['cost', `$${fmtCost(f.cost)}${f.unpriced ? ` (+${f.unpriced} unpriced)` : ''}`],
