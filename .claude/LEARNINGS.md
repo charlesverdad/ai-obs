@@ -37,3 +37,11 @@ and load-bearing — this is not a changelog.
   the pinned rustc differs from any system toolchain. `just verify` runs
   the same fmt + clippy (`-D warnings`) + test sequence as CI
   (`.github/workflows/*.yml`, `runs-on: macos-latest`).
+
+- **Transient tool shells**: current Claude Code spawns a fresh `zsh -c
+  source snapshot…` per Bash call and reaps it before PostToolUse fires —
+  there is no persistent shell to delta against. Exact per-span CPU must be
+  based on the claude process's *own* `ri_child_*` counters (wait4 rusage
+  rolls up reaped grandchildren recursively), plus any still-live direct
+  shell children. Sessions started before hook install have no claude_pid
+  (SessionStart never fired) → spans record with sampled CPU only.

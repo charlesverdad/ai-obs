@@ -114,13 +114,20 @@ fn now_ms() -> i64 {
 /// Normalise a Bash command to a compact, privacy-preserving shape:
 /// first two words, executables reduced to basenames, no flags/paths.
 pub fn cmd_digest(command: &str) -> String {
+    // Only digest the first shell segment: stop at the first separator
+    // that would start a new command (;, |, &&, ||, newline).
+    let first_segment = split_first_shell_segment(command);
     let mut words = Vec::new();
-    for w in command.split_whitespace() {
+    for w in first_segment.split_whitespace() {
         // Skip leading env assignments (FOO=bar cmd).
         if words.is_empty() && w.contains('=') && !w.starts_with('/') {
             continue;
         }
         if w.starts_with('-') {
+            break;
+        }
+        let w = w.strip_suffix(';').unwrap_or(w);
+        if w.is_empty() {
             break;
         }
         let base = w.rsplit('/').next().unwrap_or(w);
@@ -134,6 +141,21 @@ pub fn cmd_digest(command: &str) -> String {
     } else {
         words.join(" ")
     }
+}
+
+/// Split a shell command at the first occurrence of `;`, `|`, `&&`, `||`, or
+/// a newline (whichever comes first) and return everything before it.
+fn split_first_shell_segment(command: &str) -> &str {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' | b'|' | b'\n' => return &command[..i],
+            b'&' if bytes.get(i + 1) == Some(&b'&') => return &command[..i],
+            _ => i += 1,
+        }
+    }
+    command
 }
 
 impl Correlator {
@@ -481,26 +503,51 @@ impl Correlator {
     }
 }
 
-/// Sum of child-CPU ns across the session's persistent tool shells
-/// (direct shell children of the claude process). The delta of this across a
-/// span is the exact CPU of everything the span spawned and reaped.
+/// CPU basis (ns) used to measure the work a span caused: claude's own
+/// reaped-child counters (which roll up everything claude has wait4'd,
+/// including grandchildren reaped by an intermediate shell) plus, for any
+/// still-live direct-child shell, both that shell's own CPU and its reaped-
+/// child CPU. The latter covers a persistent shell whose workload hasn't
+/// been reaped yet; including the shell's own CPU (not just its children's)
+/// keeps the total monotonic across the shell's eventual death and roll-up
+/// into claude's child counters.
+///
+/// This must NOT require any live shell: current Claude Code spawns a
+/// transient `zsh -c ...` per Bash call that Claude reaps *before*
+/// PostToolUse fires, so at span-close time no shell may exist at all —
+/// the "no shell" case used to make this whole function return None,
+/// leaving tool_span.cpu_ns permanently NULL for the common case.
+///
+/// Note: because this rolls up everything claude has reaped, it also
+/// absorbs a small amount of CPU from unrelated short-lived helper
+/// processes claude spawns and reaps during the span (e.g. hook scripts
+/// like rtk). This is accepted noise, not attributable per-span.
+fn child_cpu_ns_basis(
+    base: Option<ProcUsage>,
+    shells: impl Iterator<Item = ProcUsage>,
+) -> Option<u64> {
+    let base = base?;
+    let mut total = base.child_cpu_user_ns + base.child_cpu_sys_ns;
+    for u in shells {
+        total += u.cpu_user_ns + u.cpu_sys_ns;
+        total += u.child_cpu_user_ns + u.child_cpu_sys_ns;
+    }
+    Some(total)
+}
+
+/// Live-snapshot wrapper: reads claude's own usage plus every live direct-
+/// child shell's usage, then delegates the arithmetic to
+/// [`child_cpu_ns_basis`]. Returns `Some` whenever `usage(claude_pid)`
+/// succeeds, regardless of whether any shell is currently alive.
 fn shell_child_ns(claude_pid: Option<i32>, procs: &HashMap<i32, ProcInfo>) -> Option<u64> {
     let root = claude_pid?;
-    let mut total = 0u64;
-    let mut any = false;
-    for p in procs.values() {
-        if p.ppid == root && SHELL_COMMS.contains(&p.comm.as_str()) {
-            if let Some(u) = mac::usage(p.pid) {
-                total += u.child_cpu_user_ns + u.child_cpu_sys_ns;
-                any = true;
-            }
-        }
-    }
-    if any {
-        Some(total)
-    } else {
-        None
-    }
+    let base = mac::usage(root);
+    let shell_usages: Vec<ProcUsage> = procs
+        .values()
+        .filter(|p| p.ppid == root && SHELL_COMMS.contains(&p.comm.as_str()))
+        .filter_map(|p| mac::usage(p.pid))
+        .collect();
+    child_cpu_ns_basis(base, shell_usages.into_iter())
 }
 
 pub fn snapshot_map() -> HashMap<i32, ProcInfo> {
@@ -538,6 +585,47 @@ mod tests {
         assert_eq!(cmd_digest("FOO=1 just verify"), "just verify");
         assert_eq!(cmd_digest("ls -la"), "ls");
         assert_eq!(cmd_digest(""), "sh");
+        assert_eq!(
+            cmd_digest("~/.local/bin/ai-obs doctor; echo x"),
+            "ai-obs doctor"
+        );
+        assert_eq!(cmd_digest("cargo build && cargo test"), "cargo build");
+        assert_eq!(cmd_digest("ls | head"), "ls");
+    }
+
+    fn usage_with(cpu_user: u64, cpu_sys: u64, child_user: u64, child_sys: u64) -> ProcUsage {
+        ProcUsage {
+            cpu_user_ns: cpu_user,
+            cpu_sys_ns: cpu_sys,
+            child_cpu_user_ns: child_user,
+            child_cpu_sys_ns: child_sys,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn child_cpu_ns_basis_none_when_claude_usage_missing() {
+        assert_eq!(child_cpu_ns_basis(None, std::iter::empty()), None);
+    }
+
+    #[test]
+    fn child_cpu_ns_basis_works_with_no_live_shells() {
+        // Transient-shell case: claude has already reaped the shell, so its
+        // own child counters carry the CPU and no live shell is needed.
+        let base = usage_with(0, 0, 5_000, 2_000);
+        assert_eq!(
+            child_cpu_ns_basis(Some(base), std::iter::empty()),
+            Some(7_000)
+        );
+    }
+
+    #[test]
+    fn child_cpu_ns_basis_includes_live_shell_own_and_child_cpu() {
+        let base = usage_with(0, 0, 1_000, 0);
+        let shell = usage_with(100, 50, 200, 300);
+        let total = child_cpu_ns_basis(Some(base), std::iter::once(shell));
+        // base child (1000) + shell own (100+50) + shell child (200+300)
+        assert_eq!(total, Some(1_000 + 150 + 500));
     }
 
     #[test]
