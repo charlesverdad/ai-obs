@@ -81,6 +81,18 @@ and load-bearing — this is not a changelog.
   captured at spawn time (`$!` from the backgrounding command), never by
   `pkill -f` on a substring that also matches the production process.
 
+- **Correction to the note above**: `$!` after backgrounding
+  `nix-shell --run "... ai-obs daemon"` captures the PID of the `nix-shell`
+  wrapper/subshell, *not* the actual `ai-obs daemon` child process — killing
+  that PID can exit cleanly while the daemon keeps running and holding the
+  port. Confirmed live during the security-review smoke test: `kill $!`
+  "succeeded" (no such process on retry) but `curl` against the scratch port
+  still got a response afterward. The reliable way to find the real PID for
+  a scratch daemon: `lsof -nP -iTCP:<scratch-port> -sTCP:LISTEN`, or
+  `ps aux | grep -F 'target/debug/ai-obs daemon'` (debug-build path is
+  never the production binary's `~/.local/bin/ai-obs`) — confirm the port
+  and/or binary path before sending the kill.
+
 - **Subagent lifecycle hooks (`SubagentStart`/`SubagentStop`)**: both fire
   with `agent_id`/`agent_type` in the payload alongside the common fields
   (session_id, cwd, hook_event_name); PreToolUse/PostToolUse fired inside
@@ -91,3 +103,21 @@ and load-bearing — this is not a changelog.
   SubagentStop reliably fires on abnormal termination — hence the
   SessionEnd sweep (`agent_span.end_reason = 'session_end'`) as a backstop
   for subagents whose Stop never arrives.
+
+- **DNS-rebinding guard on a loopback-only daemon**: binding to
+  `127.0.0.1` alone does not stop a malicious web page from reaching the
+  daemon — a page can get a browser to resolve an attacker-controlled
+  hostname to `127.0.0.1` (DNS rebinding) and then `fetch()` it as if it
+  were same-origin. The fix is a `Host` header allowlist, not a bind-address
+  change: axum `middleware::from_fn` checking `Host` is exactly
+  `127.0.0.1:{port}` / `localhost:{port}` / `[::1]:{port}`, 421 otherwise —
+  applied to the whole router via `.layer(...)` on the `Router`, after
+  `.with_state(...)`. Verify any in-process client (our `client.rs`) and
+  hook curl commands still send that literal Host — they do here because
+  they target `http://127.0.0.1:{port}/...` directly, but this would have
+  broken anything going through a reverse proxy or a different loopback
+  alias. Split the header-matching logic into a plain `fn(Option<&str>,
+  u16) -> bool` rather than testing the `axum::middleware::Next`-based
+  handler directly — building a real `Next` in a unit test needs the full
+  tower service stack (not a dependency this repo pulls in), while the pure
+  predicate is trivially testable and is what actually encodes the policy.
