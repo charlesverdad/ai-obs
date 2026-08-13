@@ -36,6 +36,8 @@ fn our_hooks(port: u16, exe: &str) -> Vec<(&'static str, Option<&'static str>, V
         ("PreToolUse", Some("*"), http_hook(port, "pre")),
         ("PostToolUse", Some("*"), http_hook(port, "post")),
         ("PostToolUseFailure", Some("*"), http_hook(port, "post")),
+        ("SubagentStart", None, http_hook(port, "sub")),
+        ("SubagentStop", None, http_hook(port, "sub")),
         ("SessionEnd", None, http_hook(port, "end")),
     ]
 }
@@ -230,5 +232,50 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(exists);
+    }
+
+    #[test]
+    fn our_hooks_include_subagent_lifecycle_events() {
+        let hooks = our_hooks(8770, "ai-obs");
+        let sub_events: Vec<&str> = hooks
+            .iter()
+            .filter(|(_, _, h)| {
+                h.get("url")
+                    .and_then(|u| u.as_str())
+                    .map(|u| u.ends_with("/h/sub"))
+                    .unwrap_or(false)
+            })
+            .map(|(event, _, _)| *event)
+            .collect();
+        assert_eq!(sub_events, vec!["SubagentStart", "SubagentStop"]);
+        // No matcher: fires for every agent type, matching install.rs's
+        // other unmatched (SessionStart/SessionEnd) hooks.
+        for (event, matcher, _) in &hooks {
+            if *event == "SubagentStart" || *event == "SubagentStop" {
+                assert!(matcher.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn is_ours_matches_and_uninstall_retain_logic_removes_sub_hooks() {
+        let exe = "ai-obs";
+        let sub_hook = http_hook(8770, "sub");
+        assert!(is_ours(&sub_hook, exe));
+
+        // Simulate uninstall()'s retain: a group is dropped only if every
+        // hook in it is ours.
+        let mut arr = vec![
+            json!({"hooks": [sub_hook.clone()]}),
+            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}),
+        ];
+        arr.retain(|group| {
+            !group["hooks"]
+                .as_array()
+                .map(|hs| hs.iter().all(|h| is_ours(h, exe)))
+                .unwrap_or(false)
+        });
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"][0]["command"], "rtk hook claude");
     }
 }

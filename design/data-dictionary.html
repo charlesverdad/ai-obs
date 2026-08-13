@@ -167,6 +167,24 @@ disk_read     812 450 816        disk_write  104 857 600
 proc_count    17                 leaked_count  <span class="k">1</span>   <span class="c">← node dev-server left behind</span></div>
 
 <!-- ============================================================ -->
+<h2><code>agent_span</code> — fact, one row per subagent lifetime</h2>
+<p class="tsub">The subagent's own timeline, distinct from the tool_span rows it spawns inside it. Opened by SubagentStart, closed by SubagentStop — or swept closed at SessionEnd (abnormal termination) if Stop never arrived. Draws the agent lane in the replay gantt and the TIME column in <code>top</code>'s agent rows.</p>
+<div class="scroll"><table>
+<thead><tr><th>field</th><th>type</th><th>source</th><th>meaning</th></tr></thead>
+<tbody>
+<tr><td class="f">id</td><td class="t">INTEGER PK</td><td><span class="src s-comp">computed</span></td><td></td></tr>
+<tr><td class="f">session_id</td><td class="t">TEXT FK</td><td><span class="src s-hook">hook</span></td><td>→ session</td></tr>
+<tr><td class="f">agent_id</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>Same id PreToolUse/PostToolUse carry for calls made inside this agent — the join key to tool_span</td></tr>
+<tr><td class="f">agent_type</td><td class="t">TEXT</td><td><span class="src s-hook">hook</span></td><td>The agent's frontmatter name, e.g. <code>Explore</code>, <code>general-purpose</code></td></tr>
+<tr><td class="f">started_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>SubagentStart. A redelivered Start for the same agent_id is ignored — first write wins (UNIQUE(session_id, agent_id))</td></tr>
+<tr><td class="f">ended_at</td><td class="t">INTEGER ms</td><td><span class="src s-hook">hook</span></td><td>SubagentStop, or the SessionEnd sweep if Stop never fired. Only ever set once — a later close never overwrites an earlier one</td></tr>
+<tr><td class="f">end_reason</td><td class="t">TEXT</td><td><span class="src s-comp">computed</span></td><td><code>stop</code> = normal SubagentStop · <code>session_end</code> = closed by the SessionEnd sweep · <code>daemon_restart</code> reserved, not yet swept on startup</td></tr>
+</tbody></table></div>
+<div class="sample"><span class="c">-- sample</span>
+agent_id     a1e2c9f0-…       agent_type  Explore
+started_at   …19:56:40.112    ended_at    …19:57:12.884   end_reason  stop</div>
+
+<!-- ============================================================ -->
 <h2><code>proc_stat</code> — fact, one row per process per span</h2>
 <p class="tsub">The drill-down under a tool span: which binaries actually did the work. Raw 10 Hz samples are never stored — they collapse to one row when the process exits or the span closes.</p>
 <div class="scroll"><table>
@@ -261,7 +279,7 @@ offset  48 211 904</div>
 <tr><td>Raw 10 Hz samples</td><td class="num">never persisted</td><td>2.6 GB/day if stored; collapsed in memory instead</td></tr>
 <tr><td><code>session_sample</code> (1 Hz)</td><td class="num">24 h, then 1-min buckets</td><td>Timeline stays useful, size stays bounded</td></tr>
 <tr><td><code>proc_stat</code> below noise floor</td><td class="num">7 days</td><td>Tiny processes stop mattering quickly</td></tr>
-<tr><td><code>tool_span</code>, <code>llm_usage</code>, <code>finding</code></td><td class="num">indefinite</td><td>Small rows; the long-term record per project and PR</td></tr>
+<tr><td><code>tool_span</code>, <code>llm_usage</code>, <code>finding</code>, <code>agent_span</code></td><td class="num">indefinite</td><td>Small rows; the long-term record per project and PR</td></tr>
 </tbody></table></div>
 <p class="cap">Working size on one active machine: a few MB per day. All figures configurable.</p>
 

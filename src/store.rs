@@ -89,6 +89,19 @@ pub struct LlmUsageRecord {
     pub agent_id: Option<String>,
 }
 
+/// One `agent_span` row, as returned by [`Store::agent_spans_for_session`].
+pub struct AgentSpanRow {
+    pub agent_id: String,
+    pub agent_type: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<String>,
+}
+
+/// `(session_id, agent_id) -> (started_at, ended_at)`, as returned by
+/// [`Store::agent_span_times`].
+pub type AgentSpanTimes = HashMap<(String, String), (i64, Option<i64>)>;
+
 /// One closed span, as returned by [`Store::recent_spans_all_sessions`].
 pub struct RecentSpanRow {
     pub span_id: i64,
@@ -191,6 +204,22 @@ CREATE TABLE IF NOT EXISTS finding (
 -- no pragma-guarded migration like the ALTER TABLE below.
 CREATE INDEX IF NOT EXISTS idx_llm_ts ON llm_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_span_started ON tool_span(started_at);
+-- Subagent lifetime, opened on SubagentStart and closed on SubagentStop (or
+-- swept closed by session end / daemon restart — see end_reason). A single
+-- agent_id can only be open once per session: the UNIQUE constraint backs
+-- the idempotent open/close semantics in Store::open_agent_span /
+-- close_agent_span (see their docs for the exact duplicate-event policy).
+CREATE TABLE IF NOT EXISTS agent_span (
+  id INTEGER PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES session(id),
+  agent_id TEXT NOT NULL,
+  agent_type TEXT,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  end_reason TEXT CHECK(end_reason IN ('stop','session_end','daemon_restart') OR end_reason IS NULL),
+  UNIQUE(session_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_span_session ON agent_span(session_id, started_at);
 "#;
 
 /// Schema migrations that ALTER an existing table rather than CREATE it —
@@ -519,6 +548,112 @@ impl Store {
         Ok(out)
     }
 
+    /// Open a subagent lifetime span (`SubagentStart`). Duplicate starts for
+    /// the same `(session_id, agent_id)` — e.g. a redelivered hook — are
+    /// ignored: the UNIQUE constraint makes this an `INSERT OR IGNORE`, so
+    /// the *first* `started_at`/`agent_type` observed wins and later
+    /// duplicates are silent no-ops rather than resetting the clock.
+    pub fn open_agent_span(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_type: Option<&str>,
+        started_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_span(session_id, agent_id, agent_type, started_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, agent_id, agent_type, started_at],
+        )?;
+        Ok(())
+    }
+
+    /// Close a subagent lifetime span (`SubagentStop`). Idempotent: only
+    /// rows with `ended_at IS NULL` are updated, so a redelivered Stop (or
+    /// one that races the session-end sweep) never overwrites an earlier
+    /// close's `ended_at`/`end_reason`.
+    pub fn close_agent_span(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        ended_at: i64,
+        end_reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_span SET ended_at = ?3, end_reason = ?4
+             WHERE session_id = ?1 AND agent_id = ?2 AND ended_at IS NULL",
+            params![session_id, agent_id, ended_at, end_reason],
+        )?;
+        Ok(())
+    }
+
+    /// Close every still-open agent span for a session — used at
+    /// `SessionEnd` (`end_reason = "session_end"`) to cover subagents whose
+    /// `SubagentStop` never arrived (abnormal termination), and can also be
+    /// used at daemon startup (`end_reason = "daemon_restart"`) to close
+    /// spans orphaned by a previous crash/restart.
+    pub fn close_all_open_agent_spans_for_session(
+        &self,
+        session_id: &str,
+        end_reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_span SET ended_at = ?2, end_reason = ?3
+             WHERE session_id = ?1 AND ended_at IS NULL",
+            params![session_id, now_ms(), end_reason],
+        )?;
+        Ok(())
+    }
+
+    /// All `agent_span` rows for one session, oldest first — feeds the
+    /// history dashboard's replay gantt (agent lanes).
+    pub fn agent_spans_for_session(&self, session_id: &str) -> Result<Vec<AgentSpanRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, agent_type, started_at, ended_at, end_reason
+             FROM agent_span WHERE session_id = ?1 ORDER BY started_at",
+        )?;
+        let rows = stmt
+            .query_map([session_id], |r| {
+                Ok(AgentSpanRow {
+                    agent_id: r.get(0)?,
+                    agent_type: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    end_reason: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `(session_id, agent_id) -> (started_at, ended_at)` for every
+    /// agent_span row, across all sessions — feeds the live `/api/top` tree
+    /// (agent row duration) via a short-TTL cache, same pattern as
+    /// [`Store::recent_spans_all_sessions`].
+    pub fn agent_span_times(&self) -> Result<AgentSpanTimes> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT session_id, agent_id, started_at, ended_at FROM agent_span")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (sid, aid, started_at, ended_at) = row?;
+            out.insert((sid, aid), (started_at, ended_at));
+        }
+        Ok(out)
+    }
+
     pub fn checkpoint(&self, path: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let off: Option<i64> = conn
@@ -748,6 +883,111 @@ mod tests {
         assert_eq!(
             totals[&("s1".to_string(), Some("agentA".to_string()))].output_tokens,
             75
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_span_open_close_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-asl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        let spans = s.agent_spans_for_session("s1").unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].agent_id, "agentA");
+        assert_eq!(spans[0].agent_type.as_deref(), Some("Explore"));
+        assert_eq!(spans[0].started_at, 1000);
+        assert!(spans[0].ended_at.is_none());
+
+        s.close_agent_span("s1", "agentA", 2000, "stop").unwrap();
+        let spans = s.agent_spans_for_session("s1").unwrap();
+        assert_eq!(spans[0].ended_at, Some(2000));
+        assert_eq!(spans[0].end_reason.as_deref(), Some("stop"));
+
+        // Idempotent close: a second (redelivered) Stop must not overwrite
+        // the first close's ended_at/end_reason.
+        s.close_agent_span("s1", "agentA", 9999, "session_end")
+            .unwrap();
+        let spans = s.agent_spans_for_session("s1").unwrap();
+        assert_eq!(spans[0].ended_at, Some(2000));
+        assert_eq!(spans[0].end_reason.as_deref(), Some("stop"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_span_duplicate_start_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-asd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        // A duplicate SubagentStart for the same agent_id must not error and
+        // must not reset started_at/agent_type.
+        s.open_agent_span("s1", "agentA", Some("general-purpose"), 5000)
+            .unwrap();
+        let spans = s.agent_spans_for_session("s1").unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].started_at, 1000);
+        assert_eq!(spans[0].agent_type.as_deref(), Some("Explore"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn close_all_open_agent_spans_for_session_only_touches_open_ones() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-asc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentB", Some("general-purpose"), 1500)
+            .unwrap();
+        s.close_agent_span("s1", "agentA", 2000, "stop").unwrap();
+
+        s.close_all_open_agent_spans_for_session("s1", "session_end")
+            .unwrap();
+        let mut spans = s.agent_spans_for_session("s1").unwrap();
+        spans.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        assert_eq!(spans[0].agent_id, "agentA");
+        assert_eq!(spans[0].end_reason.as_deref(), Some("stop")); // untouched
+        assert_eq!(spans[1].agent_id, "agentB");
+        assert_eq!(spans[1].end_reason.as_deref(), Some("session_end"));
+        assert!(spans[1].ended_at.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_span_times_reflects_open_and_closed_spans() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-ast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        s.close_agent_span("s1", "agentA", 2000, "stop").unwrap();
+        s.open_agent_span("s1", "agentB", None, 3000).unwrap();
+
+        let times = s.agent_span_times().unwrap();
+        assert_eq!(
+            times[&("s1".to_string(), "agentA".to_string())],
+            (1000, Some(2000))
+        );
+        assert_eq!(
+            times[&("s1".to_string(), "agentB".to_string())],
+            (3000, None)
         );
         std::fs::remove_dir_all(&dir).ok();
     }

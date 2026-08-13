@@ -12,8 +12,12 @@ call so you can find the culprit instead of guessing from `top`.
 ## How it works
 
 - HTTP hooks (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
-  `SessionStart`, `SessionEnd`) push events into a local daemon — no
-  per-tool-call forks.
+  `SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd`) push events
+  into a local daemon — no per-tool-call forks.
+- Subagent lifetimes get their own span (`agent_span`, opened on
+  `SubagentStart` and closed on `SubagentStop`), correlated to that
+  subagent's own tool calls via the shared `agent_id` — so the dashboard and
+  `top` can show a subagent's own duration, not just the tool calls it made.
 - A background sampler polls `proc_pid_rusage` for every live process at an
   adaptive rate: 10 Hz while a tool span is open, backing off to 1 Hz when
   idle, self-throttling if its own overhead grows.

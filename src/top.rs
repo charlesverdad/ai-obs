@@ -157,6 +157,13 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
             };
             let a_tok_out = i64_of(agent, "tokens_out");
             let a_cost = f64_of(agent, "cost_usd");
+            // Only populated when an agent_span row exists (main agent, or a
+            // subagent whose SubagentStart the daemon saw).
+            let a_time = agent
+                .get("duration_s")
+                .and_then(|v| v.as_f64())
+                .map(fmt_duration)
+                .unwrap_or_default();
             let open_spans = agent["open_spans"]
                 .as_array()
                 .map(|v| v.as_slice())
@@ -175,7 +182,7 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
                 pid: String::new(),
                 cpu: String::new(),
                 mem: String::new(),
-                time: String::new(),
+                time: a_time,
                 tok_in: String::new(),
                 tok_out: fmt_compact(a_tok_out),
                 cost: fmt_cost(a_cost, 0),
@@ -635,7 +642,10 @@ mod tests {
                         "cost_usd": 2.10,
                         "tokens_out": 900,
                         "open_spans": [],
-                        "recent_spans": []
+                        "recent_spans": [],
+                        "started_at": 1000,
+                        "ended_at": 43000,
+                        "duration_s": 42.0
                     }
                 ]
             }],
@@ -692,6 +702,20 @@ mod tests {
         let rows = flatten(&data, &expanded);
         assert_eq!(rows[1].key, "agent:s1:main");
         assert_eq!(rows[2].key, "agent:s1:testagent1");
+    }
+
+    #[test]
+    fn agent_row_shows_duration_from_agent_span_when_present() {
+        let data = sample();
+        let mut expanded = HashSet::new();
+        expanded.insert("sess:s1".to_string());
+        let rows = flatten(&data, &expanded);
+        // main agent has no agent_span (no duration_s field) -> blank TIME.
+        assert_eq!(rows[1].key, "agent:s1:main");
+        assert_eq!(rows[1].time, "");
+        // subagent has a 42s agent_span -> TIME shows its duration.
+        assert_eq!(rows[2].key, "agent:s1:testagent1");
+        assert_eq!(rows[2].time, "42s");
     }
 
     #[test]
