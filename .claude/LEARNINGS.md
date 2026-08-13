@@ -68,3 +68,26 @@ and load-bearing — this is not a changelog.
   `idx_llm_session(session_id, ts)` then turns it into an index lookup
   instead of a scan. Budget roughly one full `llm_usage` scan per ~150-200ms
   at this row count; a `< 1s` target caps you at ~4-5 scans total.
+
+- **`pkill -f "ai-obs daemon"` is not scoped to a scratch process**: the
+  live-tested pattern matches *any* process whose command line contains
+  that substring, including the real launchd-managed production daemon at
+  `~/.local/bin/ai-obs daemon` — even when your own test daemon was started
+  under `nix-shell --run "... target/debug/ai-obs daemon"`. This actually
+  happened during subagent-span smoke testing: the broad pkill killed the
+  production daemon; launchd's `KeepAlive` respawned it within ~1s (same db
+  path, WAL-safe reopen, no data loss observed), but it's still a hard-
+  constraint violation to avoid. Kill scratch daemons by the PID you
+  captured at spawn time (`$!` from the backgrounding command), never by
+  `pkill -f` on a substring that also matches the production process.
+
+- **Subagent lifecycle hooks (`SubagentStart`/`SubagentStop`)**: both fire
+  with `agent_id`/`agent_type` in the payload alongside the common fields
+  (session_id, cwd, hook_event_name); PreToolUse/PostToolUse fired inside
+  that subagent carry the same `agent_id`, which is the join key. One HTTP
+  hook URL (`/h/sub`) branching on `hook_event_name` covers both events —
+  no need for two settings.json entries pointing at different paths. Not
+  verified from real traffic (only synthetic smoke-tested payloads): whether
+  SubagentStop reliably fires on abnormal termination — hence the
+  SessionEnd sweep (`agent_span.end_reason = 'session_end'`) as a backstop
+  for subagents whose Stop never arrives.
