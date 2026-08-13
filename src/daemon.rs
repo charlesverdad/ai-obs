@@ -1,7 +1,7 @@
 //! The ai-obs daemon: HTTP hook endpoint + adaptive sampler + detectors.
 
 use crate::correlator::{snapshot_map, Correlator, Session, Span};
-use crate::store::{now_ms, RecentSpanRow, Store, TokenTotals};
+use crate::store::{now_ms, AgentSpanTimes, RecentSpanRow, Store, TokenTotals};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,9 @@ type AgentTokenTotalsCache =
 
 /// Timestamped, refcounted snapshot of `recent_spans_all_sessions()`.
 type RecentSpansCache = Arc<Mutex<Option<(Instant, Arc<HashMap<String, Vec<RecentSpanRow>>>)>>>;
+
+/// Timestamped, refcounted snapshot of `agent_span_times()`.
+type AgentSpanTimesCache = Arc<Mutex<Option<(Instant, Arc<AgentSpanTimes>)>>>;
 
 /// (kind, severity, session_id, span_id, pid, message)
 type Finding = (
@@ -57,6 +61,13 @@ pub struct AppState {
     pub agent_totals_cache: AgentTokenTotalsCache,
     /// Cached last-10-per-session closed spans — feeds the collapsible tree.
     pub recent_spans_cache: RecentSpansCache,
+    /// Cached `agent_span_times()` result — feeds the collapsible tree's
+    /// per-agent TIME column.
+    pub agent_span_times_cache: AgentSpanTimesCache,
+    /// `SubagentStart`/`SubagentStop` payload keys already logged at info
+    /// level (once per hook_event_name), so we can empirically discover
+    /// undocumented fields without spamming the log on every event.
+    pub logged_sub_payload_keys: Arc<Mutex<HashSet<String>>>,
     /// Dedicated read-only connection for the historical dashboard
     /// (`/api/history`, `/api/session/{id}`) — never the writer connection,
     /// so a slow aggregate can't block the PreToolUse hot path. WAL makes
@@ -79,6 +90,8 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
         token_totals_cache: Arc::new(Mutex::new(None)),
         agent_totals_cache: Arc::new(Mutex::new(None)),
         recent_spans_cache: Arc::new(Mutex::new(None)),
+        agent_span_times_cache: Arc::new(Mutex::new(None)),
+        logged_sub_payload_keys: Arc::new(Mutex::new(HashSet::new())),
         dashboard_store,
         db_path: db_path.to_path_buf(),
     };
@@ -165,10 +178,30 @@ async fn sampler_loop(state: AppState) {
     }
 }
 
+/// Agent spans open longer than this with no `SubagentStop`/`SessionEnd`
+/// are assumed abandoned (daemon crash mid-session, session never
+/// resumed) and swept closed with `end_reason = "stale"`.
+const STALE_AGENT_SPAN_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
 async fn detector_loop(state: AppState) {
+    let mut last_stale_sweep = 0i64;
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let now = now_ms();
+        // Piggyback on this loop's 10s cadence but only actually sweep once
+        // a minute — closing a handful of hours-old rows doesn't need to
+        // run every tick, and the UPDATE is a full-table scan.
+        if now - last_stale_sweep >= 60_000 {
+            last_stale_sweep = now;
+            match state
+                .store
+                .close_stale_agent_spans(STALE_AGENT_SPAN_MAX_AGE_MS)
+            {
+                Ok(n) if n > 0 => tracing::info!("swept {n} stale agent_span row(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("close_stale_agent_spans failed: {e:#}"),
+            }
+        }
         let procs = tokio::task::spawn_blocking(snapshot_map)
             .await
             .unwrap_or_default();
@@ -394,10 +427,61 @@ async fn h_post(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value>
     Json(json!({}))
 }
 
-async fn h_sub(State(_st): State<AppState>, Json(_v): Json<Value>) -> Json<Value> {
-    // Subagent lifecycle is informational; tool events already carry
-    // agent_id/agent_type. Kept as an endpoint for forward-compat.
+/// Handles both `SubagentStart` and `SubagentStop` (branching on
+/// `hook_event_name`) so `settings.json` only needs one URL for both events.
+/// Opens/closes the corresponding `agent_span` row. Unknown event names or
+/// missing required fields are logged at debug and otherwise ignored — hooks
+/// must never fail the agent.
+async fn h_sub(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value> {
+    let event = s(&v, "hook_event_name").unwrap_or_default();
+    log_sub_payload_keys_once(&st, &event, &v);
+    let Some(sid) = s(&v, "session_id") else {
+        tracing::debug!("h_sub: missing session_id, event={event}");
+        return Json(json!({}));
+    };
+    let Some(agent_id) = s(&v, "agent_id") else {
+        tracing::debug!("h_sub: missing agent_id, event={event}, session={sid}");
+        return Json(json!({}));
+    };
+    match event.as_str() {
+        "SubagentStart" => {
+            let agent_type = s(&v, "agent_type");
+            if let Err(e) =
+                st.store
+                    .open_agent_span(&sid, &agent_id, agent_type.as_deref(), now_ms())
+            {
+                tracing::debug!("h_sub: open_agent_span failed: {e:#}");
+            }
+        }
+        "SubagentStop" => {
+            if let Err(e) = st.store.close_agent_span(&sid, &agent_id, now_ms(), "stop") {
+                tracing::debug!("h_sub: close_agent_span failed: {e:#}");
+            }
+        }
+        other => {
+            tracing::debug!("h_sub: unknown hook_event_name {other:?}");
+        }
+    }
     Json(json!({}))
+}
+
+/// Log (once per `hook_event_name`, info level) the set of top-level keys
+/// present in a SubagentStart/SubagentStop payload — never values, to avoid
+/// leaking transcript/cwd contents — so undocumented fields can be verified
+/// empirically post-deploy without permanently spamming the log.
+fn log_sub_payload_keys_once(st: &AppState, event: &str, v: &Value) {
+    if event.is_empty() {
+        return;
+    }
+    let mut seen = st.logged_sub_payload_keys.lock().unwrap();
+    if !seen.insert(event.to_string()) {
+        return;
+    }
+    let keys: Vec<&str> = v
+        .as_object()
+        .map(|o| o.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    tracing::info!("h_sub: {event} payload keys: {keys:?}");
 }
 
 async fn h_end(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value> {
@@ -408,6 +492,14 @@ async fn h_end(State(st): State<AppState>, Json(v): Json<Value>) -> Json<Value> 
     {
         let mut corr = st.corr.lock().unwrap();
         corr.end_session(&st.store, &sid, reason.as_deref());
+    }
+    // Cover subagents whose SubagentStop never arrived (abnormal
+    // termination, or a client that just doesn't fire it).
+    if let Err(e) = st
+        .store
+        .close_all_open_agent_spans_for_session(&sid, "session_end")
+    {
+        tracing::debug!("h_end: close_all_open_agent_spans_for_session failed: {e:#}");
     }
     tracing::info!("session-end {sid}");
     Json(json!({}))
@@ -486,6 +578,23 @@ fn recent_spans(st: &AppState) -> Arc<HashMap<String, Vec<RecentSpanRow>>> {
     map
 }
 
+/// Same caching pattern as [`token_totals`], for `agent_span` start/end
+/// times — feeds each agent row's TIME column in the collapsible tree.
+fn agent_span_times(st: &AppState) -> Arc<AgentSpanTimes> {
+    const TTL: Duration = Duration::from_secs(2);
+    {
+        let cache = st.agent_span_times_cache.lock().unwrap();
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return map.clone();
+            }
+        }
+    }
+    let map = Arc::new(st.store.agent_span_times().unwrap_or_default());
+    *st.agent_span_times_cache.lock().unwrap() = Some((Instant::now(), map.clone()));
+    map
+}
+
 #[derive(Default)]
 struct AgentBucket {
     agent_type: Option<String>,
@@ -493,16 +602,20 @@ struct AgentBucket {
     tokens_out: i64,
     open: Vec<Value>,
     recent: Vec<Value>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
 }
 
 /// Build the "agents" array for one session: open spans (live, from the
 /// correlator) and recent closed spans (from `tool_span`), grouped by
-/// agent_id (None = main agent), plus each agent's token/cost totals.
+/// agent_id (None = main agent), plus each agent's token/cost totals and
+/// (when an `agent_span` row exists) its lifetime started_at/ended_at.
 /// Only agents with at least one span or some tokens are included.
 fn build_agents(
     sess: &Session,
     agent_totals: &HashMap<(String, Option<String>), TokenTotals>,
     recent_spans_by_session: &HashMap<String, Vec<RecentSpanRow>>,
+    agent_span_times: &AgentSpanTimes,
 ) -> Vec<Value> {
     let now = now_ms();
     let mut buckets: HashMap<Option<String>, AgentBucket> = HashMap::new();
@@ -545,6 +658,15 @@ fn build_agents(
         b.tokens_out = totals.output_tokens;
     }
 
+    for ((sid, agent_id), (started_at, ended_at)) in agent_span_times {
+        if sid != &sess.id {
+            continue;
+        }
+        let b = buckets.entry(Some(agent_id.clone())).or_default();
+        b.started_at = Some(*started_at);
+        b.ended_at = *ended_at;
+    }
+
     let mut keys: Vec<Option<String>> = buckets.keys().cloned().collect();
     keys.sort_by(|a, b| match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
@@ -556,6 +678,9 @@ fn build_agents(
     keys.into_iter()
         .map(|k| {
             let b = buckets.remove(&k).unwrap();
+            let duration_s = b
+                .started_at
+                .map(|start| ((b.ended_at.unwrap_or(now) - start).max(0)) as f64 / 1000.0);
             json!({
                 "agent_id": k,
                 "agent_type": b.agent_type,
@@ -563,6 +688,9 @@ fn build_agents(
                 "tokens_out": b.tokens_out,
                 "open_spans": b.open,
                 "recent_spans": b.recent,
+                "started_at": b.started_at,
+                "ended_at": b.ended_at,
+                "duration_s": duration_s,
             })
         })
         .collect()
@@ -602,6 +730,7 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
     let totals = token_totals(&st);
     let agent_totals = agent_token_totals(&st);
     let recent = recent_spans(&st);
+    let agent_times = agent_span_times(&st);
     let now = now_ms();
     let sessions: Vec<Value> = {
         let corr = st.corr.lock().unwrap();
@@ -639,7 +768,7 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                     "cache_read": cache_read,
                     "cost_usd": cost_usd,
                     "unpriced": unpriced,
-                    "agents": build_agents(s, &agent_totals, &recent),
+                    "agents": build_agents(s, &agent_totals, &recent, &agent_times),
                 })
             })
             .collect()

@@ -488,7 +488,7 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
         .map(|r| i(r, "n"))
         .unwrap_or(0);
     let spans = store.query_json(
-        "SELECT tool_name tool, COALESCE(cmd_digest,'') cmd, agent_type agent_type,
+        "SELECT tool_name tool, COALESCE(cmd_digest,'') cmd, agent_id agent_id, agent_type agent_type,
            started_at started_at, ended_at ended_at,
            COALESCE(cpu_ns,cpu_ns_sampled)/1e9 cpu_s, COALESCE(peak_footprint,0)/1e6 peak_mb,
            ok ok, leaked_count leaked
@@ -515,6 +515,21 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
     } else {
         (Vec::new(), String::new())
     };
+
+    // ---- agent_spans: subagent lifetime, for the replay gantt's agent lanes ----
+    let agent_spans: Vec<Value> = store
+        .agent_spans_for_session(id)?
+        .into_iter()
+        .map(|a| {
+            json!({
+                "agent_id": a.agent_id,
+                "agent_type": a.agent_type,
+                "started_at": a.started_at,
+                "ended_at": a.ended_at,
+                "end_reason": a.end_reason,
+            })
+        })
+        .collect();
 
     // ---- medians: this project's per-session metrics, all time ----
     let mut this_session = json!({"cost": 0.0, "cpu_s": 0.0, "peak_mb": 0.0, "calls": 0.0});
@@ -572,6 +587,7 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
         "samples": samples_out,
         "spans": spans,
         "spans_total": total_spans,
+        "agent_spans": agent_spans,
         "tree": { "cmd": tree_cmd, "procs": tree },
         "medians": { "project": medians, "session": this_session },
     })))
@@ -680,6 +696,46 @@ mod tests {
         assert_eq!(result["samples"].as_array().unwrap().len(), 0);
         assert_eq!(result["spans"].as_array().unwrap().len(), 0);
         assert_eq!(result["tree"]["procs"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_session_without_agent_spans_is_empty_array() {
+        let (dir, store) = scratch();
+        store
+            .upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        let result = build_session(&store, "s1").unwrap().unwrap();
+        assert_eq!(result["agent_spans"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_session_includes_agent_spans() {
+        let (dir, store) = scratch();
+        store
+            .upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        store
+            .open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        store
+            .close_agent_span("s1", "agentA", 5000, "stop")
+            .unwrap();
+        store
+            .open_agent_span("s1", "agentB", Some("general-purpose"), 6000)
+            .unwrap();
+
+        let result = build_session(&store, "s1").unwrap().unwrap();
+        let spans = result["agent_spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0]["agent_id"], "agentA");
+        assert_eq!(spans[0]["agent_type"], "Explore");
+        assert_eq!(spans[0]["started_at"], 1000);
+        assert_eq!(spans[0]["ended_at"], 5000);
+        assert_eq!(spans[0]["end_reason"], "stop");
+        assert_eq!(spans[1]["agent_id"], "agentB");
+        assert!(spans[1]["ended_at"].is_null());
         std::fs::remove_dir_all(&dir).ok();
     }
 
