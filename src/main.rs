@@ -2,6 +2,7 @@ mod client;
 mod correlator;
 mod daemon;
 mod doctor;
+mod history;
 mod install;
 mod mac;
 mod pricing;
@@ -68,6 +69,8 @@ enum Cmd {
     /// SessionStart hook helper (internal): registers the session + claude PID
     #[command(hide = true)]
     SessionStart,
+    /// Open the historical web dashboard served by the daemon
+    Dashboard,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,7 +114,26 @@ fn main() -> anyhow::Result<()> {
             json,
         }),
         Cmd::SessionStart => session_start(),
+        Cmd::Dashboard => dashboard(),
     }
+}
+
+/// `ai-obs dashboard`: print the dashboard URL and open it in the default
+/// browser. If the daemon isn't reachable, say so instead of opening a dead
+/// tab — the dashboard endpoint lives entirely in the daemon process.
+fn dashboard() -> anyhow::Result<()> {
+    let port = daemon::port();
+    let url = format!("http://127.0.0.1:{port}/");
+    if client::get_json(port, "/api/status").is_err() {
+        println!("ai-obs daemon not reachable on port {port}.");
+        println!(
+            "Start it with `ai-obs daemon` (or `just daemon`), then run `ai-obs dashboard` again."
+        );
+        return Ok(());
+    }
+    println!("{url}");
+    let _ = std::process::Command::new("open").arg(&url).status();
+    Ok(())
 }
 
 /// Runs as a SessionStart command hook. Reads the hook payload from stdin,

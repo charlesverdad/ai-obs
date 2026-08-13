@@ -51,3 +51,73 @@ and load-bearing — this is not a changelog.
   code signature and launchd refuses to respawn it ("spawn scheduled" forever).
   Always `cp` to a temp name then `mv -f` (new inode), then
   `launchctl kickstart -k gui/$UID/dev.ai-obs.daemon`.
+
+- **Dashboard aggregate queries over `llm_usage` (history.rs)**: this table
+  is the dominant cost at real scale (300k+ rows on a live install vs. a few
+  hundred in `tool_span`/`session`). `date(ts/1000,'unixepoch','localtime')`
+  is *non-deterministic* to SQLite (depends on OS timezone) so it can't back
+  an index — `CREATE INDEX ... (date(...))` errors with "non-deterministic
+  use of date() in an index". The only lever is minimizing the *number* of
+  full-table scans: (1) never write one correlated subquery per output
+  metric/day — GROUP BY once and derive every number from that one result
+  set in Rust; a naive "one subquery per day" bar-chart query is O(days)
+  full scans and single-handedly blew the budget from ~150ms to ~9s; (2)
+  when a later query only needs a handful of session_ids (e.g. per-session
+  totals for a LIMIT 60 sessions list), filter the `llm_usage` subquery with
+  `session_id IN (<narrow set>)` rather than aggregating the whole table —
+  `idx_llm_session(session_id, ts)` then turns it into an index lookup
+  instead of a scan. Budget roughly one full `llm_usage` scan per ~150-200ms
+  at this row count; a `< 1s` target caps you at ~4-5 scans total.
+
+- **`pkill -f "ai-obs daemon"` is not scoped to a scratch process**: the
+  live-tested pattern matches *any* process whose command line contains
+  that substring, including the real launchd-managed production daemon at
+  `~/.local/bin/ai-obs daemon` — even when your own test daemon was started
+  under `nix-shell --run "... target/debug/ai-obs daemon"`. This actually
+  happened during subagent-span smoke testing: the broad pkill killed the
+  production daemon; launchd's `KeepAlive` respawned it within ~1s (same db
+  path, WAL-safe reopen, no data loss observed), but it's still a hard-
+  constraint violation to avoid. Kill scratch daemons by the PID you
+  captured at spawn time (`$!` from the backgrounding command), never by
+  `pkill -f` on a substring that also matches the production process.
+
+- **Correction to the note above**: `$!` after backgrounding
+  `nix-shell --run "... ai-obs daemon"` captures the PID of the `nix-shell`
+  wrapper/subshell, *not* the actual `ai-obs daemon` child process — killing
+  that PID can exit cleanly while the daemon keeps running and holding the
+  port. Confirmed live during the security-review smoke test: `kill $!`
+  "succeeded" (no such process on retry) but `curl` against the scratch port
+  still got a response afterward. The reliable way to find the real PID for
+  a scratch daemon: `lsof -nP -iTCP:<scratch-port> -sTCP:LISTEN`, or
+  `ps aux | grep -F 'target/debug/ai-obs daemon'` (debug-build path is
+  never the production binary's `~/.local/bin/ai-obs`) — confirm the port
+  and/or binary path before sending the kill.
+
+- **Subagent lifecycle hooks (`SubagentStart`/`SubagentStop`)**: both fire
+  with `agent_id`/`agent_type` in the payload alongside the common fields
+  (session_id, cwd, hook_event_name); PreToolUse/PostToolUse fired inside
+  that subagent carry the same `agent_id`, which is the join key. One HTTP
+  hook URL (`/h/sub`) branching on `hook_event_name` covers both events —
+  no need for two settings.json entries pointing at different paths. Not
+  verified from real traffic (only synthetic smoke-tested payloads): whether
+  SubagentStop reliably fires on abnormal termination — hence the
+  SessionEnd sweep (`agent_span.end_reason = 'session_end'`) as a backstop
+  for subagents whose Stop never arrives.
+
+- **DNS-rebinding guard on a loopback-only daemon**: binding to
+  `127.0.0.1` alone does not stop a malicious web page from reaching the
+  daemon — a page can get a browser to resolve an attacker-controlled
+  hostname to `127.0.0.1` (DNS rebinding) and then `fetch()` it as if it
+  were same-origin. The fix is a `Host` header allowlist, not a bind-address
+  change: axum `middleware::from_fn` checking `Host` is exactly
+  `127.0.0.1:{port}` / `localhost:{port}` / `[::1]:{port}`, 421 otherwise —
+  applied to the whole router via `.layer(...)` on the `Router`, after
+  `.with_state(...)`. Verify any in-process client (our `client.rs`) and
+  hook curl commands still send that literal Host — they do here because
+  they target `http://127.0.0.1:{port}/...` directly, but this would have
+  broken anything going through a reverse proxy or a different loopback
+  alias. Split the header-matching logic into a plain `fn(Option<&str>,
+  u16) -> bool` rather than testing the `axum::middleware::Next`-based
+  handler directly — building a real `Next` in a unit test needs the full
+  tower service stack (not a dependency this repo pulls in), while the pure
+  predicate is trivially testable and is what actually encodes the policy.
