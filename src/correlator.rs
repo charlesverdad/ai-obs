@@ -38,6 +38,23 @@ pub struct ProcAgg {
     pub exited: bool,
 }
 
+/// A process that never got attributed to a span (no span was open when it
+/// first appeared, or it was a depth-1 shell). Tracked at session level so
+/// the orphan sweep can still catch it if it turns out truly detached.
+#[derive(Clone, Debug)]
+pub struct LooseProc {
+    pub agg: ProcAgg,
+    pub reported: bool,
+}
+
+/// One orphan finding raised from the loose-proc sweep.
+pub struct LooseFinding {
+    pub pid: i32,
+    pub comm: String,
+    pub age_ms: i64,
+    pub footprint_mb: u64,
+}
+
 pub struct Span {
     pub tool_use_id: Option<String>,
     pub tool_name: String,
@@ -68,7 +85,7 @@ pub struct Session {
     pub open_spans: Vec<Span>,
     /// Session-level process aggregates for procs not inside any span
     /// (or ambiguous). Flushed on session end.
-    pub loose_procs: HashMap<i32, ProcAgg>,
+    pub loose_procs: HashMap<i32, LooseProc>,
     /// Spans closed but with still-live descendants — orphan candidates:
     /// (span_id, pid, comm, closed_at, last footprint, reported).
     pub orphan_watch: Vec<OrphanWatch>,
@@ -89,6 +106,59 @@ pub struct OrphanWatch {
     pub cmd_digest: Option<String>,
     pub closed_at: i64,
     pub reported: bool,
+}
+
+impl Session {
+    /// Sweep `loose_procs` for orphans: still alive, older than 120s (by
+    /// first_seen), not allowlisted, and no longer a descendant of the
+    /// session's claude process (i.e. reparented away — truly detached,
+    /// vs. merely never having been inside an open span). Attribution here
+    /// is weaker than the span-based orphan watch (we never saw this proc
+    /// open a span), so callers should raise these at a lower severity.
+    ///
+    /// Marks matched entries `reported` (so they fire once) and prunes dead
+    /// pids so `loose_procs` doesn't grow unboundedly over a long session.
+    pub fn sweep_loose_orphans(
+        &mut self,
+        procs: &HashMap<i32, ProcInfo>,
+        now: i64,
+    ) -> Vec<LooseFinding> {
+        self.loose_procs.retain(|pid, _| procs.contains_key(pid));
+        let desc = self
+            .claude_pid
+            .map(|root| descendants_with_depth(root, procs).0)
+            .unwrap_or_default();
+        let mut findings = Vec::new();
+        for (pid, lp) in self.loose_procs.iter_mut() {
+            if lp.reported {
+                continue;
+            }
+            let age_ms = now - lp.agg.first_seen;
+            if age_ms < 120_000 {
+                continue;
+            }
+            let is_allowed = ORPHAN_ALLOWLIST
+                .iter()
+                .any(|a| lp.agg.info.comm.starts_with(a));
+            if is_allowed {
+                continue;
+            }
+            if desc.contains(pid) {
+                continue; // still attached to the claude tree — not detached
+            }
+            lp.reported = true;
+            let footprint_mb = mac::usage(*pid)
+                .map(|u| u.phys_footprint / 1_000_000)
+                .unwrap_or(0);
+            findings.push(LooseFinding {
+                pid: *pid,
+                comm: lp.agg.info.comm.clone(),
+                age_ms,
+                footprint_mb,
+            });
+        }
+        findings
+    }
 }
 
 #[derive(Default)]
@@ -270,6 +340,50 @@ impl Correlator {
         sess.current_tool = sess.open_spans.last().map(|s| s.tool_name.clone());
         let ended_at = now_ms();
 
+        // Adopt-at-close: catch processes that were spawned and reaped (or
+        // just spawned) entirely inside a sampler gap — e.g. the adaptive
+        // throttle had backed off to 1 Hz idle and a short-lived process's
+        // whole visible window fell inside the ~900ms gap between ticks, so
+        // no tick ever attributed it. Walk the *current* snapshot for
+        // descendants of the session's claude process that plausibly belong
+        // to this span (by kernel start time) and aren't already attributed
+        // elsewhere, and fold them in with a fresh usage read.
+        if let Some(claude_pid) = sess.claude_pid {
+            let attributed: HashSet<i32> = sess
+                .open_spans
+                .iter()
+                .flat_map(|s| s.procs.keys().copied())
+                .chain(span.procs.keys().copied())
+                .collect();
+            let candidates = adopt_candidates(procs, claude_pid, span.started_at, &attributed);
+            if !candidates.is_empty() {
+                let (_, depth_of) = descendants_with_depth(claude_pid, procs);
+                for pid in candidates {
+                    let Some(info) = procs.get(&pid) else {
+                        continue;
+                    };
+                    let Some(u) = mac::usage(pid) else {
+                        continue;
+                    };
+                    let depth = depth_of.get(&pid).copied().unwrap_or(-1);
+                    let start_ms = (info.start_sec as i64) * 1000;
+                    span.procs.insert(
+                        pid,
+                        ProcAgg {
+                            info: info.clone(),
+                            depth,
+                            first_seen: start_ms,
+                            last_seen: ended_at,
+                            last_usage: u,
+                            peak_footprint: u.lifetime_max_footprint,
+                            exited: false,
+                        },
+                    );
+                    sess.loose_procs.remove(&pid);
+                }
+            }
+        }
+
         // Exact CPU: shell child-CPU delta across the span.
         let cpu_ns = match (
             span.shell_child_base_ns,
@@ -372,31 +486,12 @@ impl Correlator {
     /// attribute new pids to open spans, refresh usage.
     pub fn tick(&mut self, procs: &HashMap<i32, ProcInfo>) {
         let now = now_ms();
-        // children map
-        let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
-        for p in procs.values() {
-            children.entry(p.ppid).or_default().push(p.pid);
-        }
 
         for sess in self.sessions.values_mut() {
             let Some(root) = sess.claude_pid else {
                 continue;
             };
-            // BFS descendants of the claude process (excluding claude itself).
-            let mut desc: HashSet<i32> = HashSet::new();
-            let mut stack = vec![root];
-            let mut depth_of: HashMap<i32, i32> = HashMap::new();
-            depth_of.insert(root, 0);
-            while let Some(pid) = stack.pop() {
-                if let Some(kids) = children.get(&pid) {
-                    for &k in kids {
-                        if desc.insert(k) {
-                            depth_of.insert(k, depth_of.get(&pid).copied().unwrap_or(0) + 1);
-                            stack.push(k);
-                        }
-                    }
-                }
-            }
+            let (desc, depth_of) = descendants_with_depth(root, procs);
             // Sticky union: keep tracking pids that reparented away, drop exited.
             sess.sticky.retain(|pid| procs.contains_key(pid));
             for &pid in &desc {
@@ -459,16 +554,25 @@ impl Correlator {
                         // Skip the persistent shells themselves — they are
                         // infrastructure, not workload.
                         if depth == 1 && SHELL_COMMS.contains(&agg.info.comm.as_str()) {
-                            sess.loose_procs.insert(pid, agg);
+                            sess.loose_procs.entry(pid).or_insert_with(|| LooseProc {
+                                agg,
+                                reported: false,
+                            });
                         } else {
                             span.procs.insert(pid, agg);
                         }
                     }
                     None => {
-                        sess.loose_procs.entry(pid).or_insert(agg);
+                        sess.loose_procs.entry(pid).or_insert_with(|| LooseProc {
+                            agg,
+                            reported: false,
+                        });
                     }
                 }
             }
+            // Prune loose procs whose pid vanished from the snapshot, so the
+            // map doesn't grow unboundedly over a long session.
+            sess.loose_procs.retain(|pid, _| procs.contains_key(pid));
 
             // cpu% from delta
             if sess.prev_tick_ms > 0 && now > sess.prev_tick_ms {
@@ -550,6 +654,71 @@ fn shell_child_ns(claude_pid: Option<i32>, procs: &HashMap<i32, ProcInfo>) -> Op
     child_cpu_ns_basis(base, shell_usages.into_iter())
 }
 
+/// BFS descendants of `root` in the given snapshot (excluding `root` itself),
+/// plus each descendant's depth below `root`. Shared by [`Correlator::tick`]
+/// and the adopt-at-close logic in [`Correlator::close_span`].
+fn descendants_with_depth(
+    root: i32,
+    procs: &HashMap<i32, ProcInfo>,
+) -> (HashSet<i32>, HashMap<i32, i32>) {
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    for p in procs.values() {
+        children.entry(p.ppid).or_default().push(p.pid);
+    }
+    let mut desc: HashSet<i32> = HashSet::new();
+    let mut stack = vec![root];
+    let mut depth_of: HashMap<i32, i32> = HashMap::new();
+    depth_of.insert(root, 0);
+    while let Some(pid) = stack.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for &k in kids {
+                if desc.insert(k) {
+                    depth_of.insert(k, depth_of.get(&pid).copied().unwrap_or(0) + 1);
+                    stack.push(k);
+                }
+            }
+        }
+    }
+    (desc, depth_of)
+}
+
+/// Descendant pids of `root` in the given snapshot (excluding `root`).
+#[cfg(test)]
+fn descendants(root: i32, procs: &HashMap<i32, ProcInfo>) -> HashSet<i32> {
+    descendants_with_depth(root, procs).0
+}
+
+/// Pure selection logic for adopt-at-close: which descendants of `claude_pid`
+/// in the current snapshot plausibly belong to a span that started at
+/// `span_started_at` and haven't already been attributed anywhere else.
+///
+/// Excludes: pids in `attributed` (already in this or another open span),
+/// pids that started before the span opened (with the same 2s clock-
+/// granularity slack `tick()` uses), and depth-1 shells (infrastructure, not
+/// workload — same as `tick()`'s treatment of new pids).
+fn adopt_candidates(
+    procs: &HashMap<i32, ProcInfo>,
+    claude_pid: i32,
+    span_started_at: i64,
+    attributed: &HashSet<i32>,
+) -> Vec<i32> {
+    let (desc, depth_of) = descendants_with_depth(claude_pid, procs);
+    desc.into_iter()
+        .filter(|pid| !attributed.contains(pid))
+        .filter(|pid| {
+            procs.get(pid).is_some_and(|info| {
+                let start_ms = (info.start_sec as i64) * 1000;
+                start_ms >= span_started_at - 2000
+            })
+        })
+        .filter(|pid| {
+            let depth = depth_of.get(pid).copied().unwrap_or(-1);
+            let comm = procs.get(pid).map(|i| i.comm.as_str()).unwrap_or("");
+            !(depth == 1 && SHELL_COMMS.contains(&comm))
+        })
+        .collect()
+}
+
 pub fn snapshot_map() -> HashMap<i32, ProcInfo> {
     mac::list_processes()
         .into_iter()
@@ -626,6 +795,88 @@ mod tests {
         let total = child_cpu_ns_basis(Some(base), std::iter::once(shell));
         // base child (1000) + shell own (100+50) + shell child (200+300)
         assert_eq!(total, Some(1_000 + 150 + 500));
+    }
+
+    fn proc(pid: i32, ppid: i32, comm: &str, start_sec: u64) -> ProcInfo {
+        ProcInfo {
+            pid,
+            ppid,
+            comm: comm.to_string(),
+            name: comm.to_string(),
+            start_sec,
+        }
+    }
+
+    #[test]
+    fn adopt_candidates_picks_up_missed_descendant() {
+        // claude(1) -> shell(2) -> python(3), python started 100ms after the
+        // span opened (started_at=10_000ms => start_sec=10). Nothing has
+        // attributed pid 3 anywhere yet.
+        let procs: HashMap<i32, ProcInfo> = [
+            proc(1, 0, "claude", 0),
+            proc(2, 1, "zsh", 10),
+            proc(3, 2, "python3", 10),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect();
+        let attributed = HashSet::new();
+        // pid 2 is a depth-1 shell (excluded); pid 3, the grandchild that was
+        // actually missed by the sampler, is adopted.
+        let got = adopt_candidates(&procs, 1, 10_000, &attributed);
+        assert_eq!(got, vec![3]);
+    }
+
+    #[test]
+    fn adopt_candidates_excludes_already_attributed() {
+        let procs: HashMap<i32, ProcInfo> = [proc(1, 0, "claude", 0), proc(2, 1, "python3", 10)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        let mut attributed = HashSet::new();
+        attributed.insert(2);
+        let got = adopt_candidates(&procs, 1, 10_000, &attributed);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn adopt_candidates_excludes_procs_older_than_span() {
+        // pid 2 started well before the span opened (started_at=10_000ms,
+        // start_sec=1 => 1_000ms, outside the 2s slack window).
+        let procs: HashMap<i32, ProcInfo> = [proc(1, 0, "claude", 0), proc(2, 1, "python3", 1)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        let attributed = HashSet::new();
+        let got = adopt_candidates(&procs, 1, 10_000, &attributed);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn adopt_candidates_excludes_depth1_shells() {
+        let procs: HashMap<i32, ProcInfo> = [proc(1, 0, "claude", 0), proc(2, 1, "zsh", 10)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        let attributed = HashSet::new();
+        let got = adopt_candidates(&procs, 1, 10_000, &attributed);
+        assert!(got.is_empty(), "depth-1 shell should be excluded: {got:?}");
+    }
+
+    #[test]
+    fn descendants_finds_grandchildren() {
+        let procs: HashMap<i32, ProcInfo> = [
+            proc(1, 0, "claude", 0),
+            proc(2, 1, "zsh", 0),
+            proc(3, 2, "python3", 0),
+            proc(99, 0, "unrelated", 0),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect();
+        let mut got: Vec<i32> = descendants(1, &procs).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![2, 3]);
     }
 
     #[test]

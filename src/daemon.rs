@@ -201,6 +201,30 @@ async fn detector_loop(state: AppState) {
                 sess.orphan_watch
                     .retain(|w| !w.reported || procs.contains_key(&w.pid));
 
+                // Loose-proc orphan sweep: processes that were never attributed
+                // to a span at all (e.g. the adopt-at-close fallback also
+                // missed them, or they simply appeared with no span open) but
+                // have since reparented away from the claude tree and stuck
+                // around. Attribution is weaker here than the span-based
+                // orphan_watch above, so these report at 'warn' not 'crit'.
+                for lf in sess.sweep_loose_orphans(&procs, now) {
+                    findings.push((
+                        "orphan".into(),
+                        "warn".into(),
+                        Some(sess.id.clone()),
+                        None,
+                        Some(lf.pid),
+                        format!(
+                            "{} (pid {}) detached, unattributed, alive {}m in {}, {} MB",
+                            lf.comm,
+                            lf.pid,
+                            (lf.age_ms / 60_000).max(1),
+                            project,
+                            lf.footprint_mb
+                        ),
+                    ));
+                }
+
                 // Leak: sustained growth, footprint > 2 GB and cpu evidence over 10 min
                 // is done from session_sample by the reporter; here a cheap live check.
                 if sess.footprint > 6 << 30 {
