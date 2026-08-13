@@ -668,6 +668,14 @@
       const mark = s.leaked > 0 ? 'var(--red)' : (s.failed > 0 ? 'var(--text-dim)' : 'transparent');
       const flag = s.leaked > 0 ? `${s.leaked} leaked` : (s.failed > 0 ? `${s.failed} failed` : '');
       const flagColor = s.leaked > 0 ? 'var(--red)' : 'var(--text-dim2)';
+      // `status` is server-derived (history.rs `derive_status`): the raw
+      // end_reason when the session actually ended, else "running" (recent
+      // activity within the last 10 min) or "inactive" (end_reason was
+      // never recorded and nothing recent — a backfilled/stale session,
+      // not an actually-running one). "running" gets a brighter/emphasized
+      // treatment; "inactive" stays as dim as a normal ended reason —
+      // never the running accent.
+      const statusColor = s.status === 'running' ? 'var(--text-mid)' : 'var(--text-dim2)';
       return `
       <div class="session-row${state.selectedSession === s.id ? ' selected' : ''}" data-id="${esc(s.id)}">
         <span style="width:124px;display:flex;align-items:center;gap:9px">
@@ -684,7 +692,7 @@
         <span style="width:64px;color:var(--text-dim)" class="col-r">${fmtCompact(s.tokens_out)}</span>
         <span style="width:74px;color:var(--text-max)" class="col-r">$${fmtCost(s.cost)}</span>
         <span style="flex:1;padding-left:24px;display:flex;align-items:center;gap:10px;white-space:nowrap;overflow:hidden">
-          <span style="color:var(--text-dim2)">${esc(s.end_reason || (s.ended_at ? 'ended' : 'running'))}</span>
+          <span style="color:${statusColor}">${esc(s.status)}</span>
           <span style="color:${flagColor}">${esc(flag)}</span>
         </span>
       </div>`;
@@ -706,7 +714,14 @@
     const panel = document.getElementById('replayPanel');
     if (!data) { panel.innerHTML = ''; return; }
     const f = data.facts;
-    const durationS = f.ended_at ? (f.ended_at - f.started_at) / 1000 : (Date.now() - f.started_at) / 1000;
+    // Mirrors history.rs `derive_status`: an ended session's duration is
+    // ended_at - started_at; a "running" one (recent activity) counts up to
+    // now; a derived-"inactive" one (end_reason NULL, nothing recent — e.g.
+    // backfilled history predating hook install) stops at its last known
+    // activity rather than growing forever against `now`.
+    const durationS = f.ended_at ? (f.ended_at - f.started_at) / 1000
+      : f.status === 'running' ? (Date.now() - f.started_at) / 1000
+      : (f.last_activity_ms - f.started_at) / 1000;
 
     if (!data.samples.length && !data.spans.length) {
       panel.innerHTML = `
@@ -789,7 +804,7 @@
         : (f.pr_number ? '#' + f.pr_number : '—')],
       ['claude pid', f.claude_pid != null ? f.claude_pid : '—'],
       ['cc version', f.cc_version || '—'],
-      ['end reason', f.end_reason || (f.ended_at ? '—' : 'running')],
+      ['end reason', f.end_reason || (f.status === 'running' ? 'running' : 'inactive (no end event recorded)')],
       ['calls', f.calls],
       ['tokens', `${fmtCompact(f.tokens_in)} in · ${fmtCompact(f.tokens_out)} out · ${fmtCompact(f.cache_read)} cache`],
       ['cost', `$${fmtCost(f.cost)}${f.unpriced ? ` (+${f.unpriced} unpriced)` : ''}`],
