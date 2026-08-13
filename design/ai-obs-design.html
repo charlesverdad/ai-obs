@@ -1,0 +1,853 @@
+<title>Meter</title>
+<style>
+/* ============ tokens: light is the base, both dark states redefine ============ */
+:root{
+  --ground:#F3F5F3;
+  --surface:#FFFFFF;
+  --surface-2:#E9EDEB;
+  --ink:#141B1E;
+  --ink-2:#3D4A4E;
+  --muted:#66787D;
+  --rule:#D2DAD7;
+  --rule-soft:#E2E8E5;
+  --accent:#0E6C76;
+  --accent-soft:#D6E9EA;
+  --ok:#2F6E4A;
+  --warn:#96650B;
+  --crit:#9E3223;
+  --ok-bg:#DFEBE2;
+  --warn-bg:#F3E7CC;
+  --crit-bg:#F3DCD8;
+  --code-bg:#EDF1EF;
+  --shadow:0 1px 2px rgba(20,27,30,.06), 0 8px 24px -16px rgba(20,27,30,.28);
+
+  --display:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+  --body:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1416;
+    --surface:#151D20;
+    --surface-2:#1C262A;
+    --ink:#E3EBEB;
+    --ink-2:#BCC9CA;
+    --muted:#82989C;
+    --rule:#2A373B;
+    --rule-soft:#212D31;
+    --accent:#54C2CC;
+    --accent-soft:#17383D;
+    --ok:#79C295;
+    --warn:#DCAE55;
+    --crit:#E38574;
+    --ok-bg:#163024;
+    --warn-bg:#33270F;
+    --crit-bg:#3A1F1A;
+    --code-bg:#111A1D;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1416;
+  --surface:#151D20;
+  --surface-2:#1C262A;
+  --ink:#E3EBEB;
+  --ink-2:#BCC9CA;
+  --muted:#82989C;
+  --rule:#2A373B;
+  --rule-soft:#212D31;
+  --accent:#54C2CC;
+  --accent-soft:#17383D;
+  --ok:#79C295;
+  --warn:#DCAE55;
+  --crit:#E38574;
+  --ok-bg:#163024;
+  --warn-bg:#33270F;
+  --crit-bg:#3A1F1A;
+  --code-bg:#111A1D;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--body); font-size:16.5px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1160px;margin:0 auto;padding:0 24px 96px;display:grid;grid-template-columns:1fr;gap:0}
+@media(min-width:1080px){
+  .wrap{grid-template-columns:212px minmax(0,1fr);column-gap:56px;align-items:start}
+  .toc{position:sticky;top:32px;padding-top:48px}
+}
+.toc{display:none;font-family:var(--body)}
+@media(min-width:1080px){.toc{display:block}}
+.toc ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px;border-left:1px solid var(--rule);}
+.toc a{display:block;padding:4px 0 4px 14px;margin-left:-1px;border-left:2px solid transparent;
+  color:var(--muted);text-decoration:none;font-size:13.5px;line-height:1.35}
+.toc a:hover{color:var(--accent);border-left-color:var(--accent)}
+.toc .tocnum{font-family:var(--mono);font-size:11px;opacity:.7;margin-right:7px}
+.toc h4{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:0 0 12px 14px;font-weight:600}
+
+main{min-width:0;padding-top:0}
+
+/* ============ masthead ============ */
+header.mast{padding:56px 0 28px;border-bottom:1px solid var(--rule)}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--accent);margin:0 0 18px;font-weight:600}
+h1{font-family:var(--display);font-weight:400;font-size:clamp(38px,6vw,60px);line-height:1.04;
+  margin:0 0 18px;letter-spacing:-.015em;text-wrap:balance}
+.standfirst{font-size:19px;line-height:1.6;color:var(--ink-2);margin:0;max-width:62ch}
+.meta{display:flex;flex-wrap:wrap;gap:8px 28px;margin-top:26px;
+  font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.meta b{font-weight:600;color:var(--ink-2)}
+
+/* ============ headings ============ */
+h2{font-family:var(--display);font-weight:400;font-size:30px;line-height:1.18;
+  margin:64px 0 6px;letter-spacing:-.01em;scroll-margin-top:24px;text-wrap:balance}
+h2 .num{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:.1em;
+  display:block;margin-bottom:10px;font-weight:600}
+h3{font-family:var(--body);font-weight:650;font-size:16px;margin:34px 0 6px;letter-spacing:-.005em}
+h4{font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;margin:26px 0 8px}
+p{margin:0 0 15px;max-width:70ch}
+ul,ol{margin:0 0 15px;padding-left:22px;max-width:70ch}
+li{margin:0 0 7px}
+li::marker{color:var(--muted)}
+a{color:var(--accent)}
+strong{font-weight:650}
+hr{border:0;border-top:1px solid var(--rule-soft);margin:40px 0}
+.lede{font-size:17.5px;color:var(--ink-2);max-width:66ch}
+
+code{font-family:var(--mono);font-size:.855em;background:var(--code-bg);
+  padding:1.5px 5px;border-radius:3px;border:1px solid var(--rule-soft)}
+pre{margin:16px 0 20px;background:var(--code-bg);border:1px solid var(--rule);
+  border-radius:6px;padding:16px 18px;overflow-x:auto;font-size:13px;line-height:1.6}
+pre code{background:none;border:0;padding:0;font-size:13px}
+.c-com{color:var(--muted)}
+.c-key{color:var(--accent)}
+
+/* ============ figures / tables ============ */
+figure{margin:24px 0 26px}
+figcaption{font-family:var(--mono);font-size:11px;color:var(--muted);
+  margin-top:10px;letter-spacing:.03em;line-height:1.5}
+.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:520px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--rule-soft);vertical-align:top}
+thead th{font-family:var(--mono);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;background:var(--surface-2);border-bottom:1px solid var(--rule);
+  white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td.num,th.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+td code{font-size:12px}
+
+.pill{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:600;
+  letter-spacing:.06em;padding:2px 7px;border-radius:3px;white-space:nowrap;text-transform:uppercase}
+.p-ok{background:var(--ok-bg);color:var(--ok)}
+.p-warn{background:var(--warn-bg);color:var(--warn)}
+.p-crit{background:var(--crit-bg);color:var(--crit)}
+
+/* ============ callouts ============ */
+.note{border:1px solid var(--rule);border-left:3px solid var(--accent);background:var(--surface);
+  border-radius:0 6px 6px 0;padding:16px 20px;margin:24px 0;box-shadow:var(--shadow)}
+.note.finding{border-left-color:var(--ok)}
+.note.risk{border-left-color:var(--crit)}
+.note .tag{font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
+  font-weight:600;color:var(--accent);display:block;margin-bottom:7px}
+.note.finding .tag{color:var(--ok)}
+.note.risk .tag{color:var(--crit)}
+.note p:last-child,.note ul:last-child{margin-bottom:0}
+
+.cards{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));margin:22px 0 26px}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:16px 18px;
+  box-shadow:var(--shadow)}
+.card h5{margin:0 0 6px;font-size:14.5px;font-weight:650}
+.card p{margin:0;font-size:13.5px;color:var(--ink-2);line-height:1.55}
+.card .k{font-family:var(--mono);font-size:22px;font-variant-numeric:tabular-nums;
+  color:var(--accent);display:block;margin-bottom:2px;letter-spacing:-.02em}
+.card .u{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);display:block;margin-bottom:8px}
+
+svg.diagram{display:block;width:100%;height:auto;max-width:100%}
+.dg-box{fill:var(--surface);stroke:var(--rule)}
+.dg-box-2{fill:var(--surface-2);stroke:var(--rule)}
+.dg-accent{fill:var(--accent-soft);stroke:var(--accent)}
+.dg-t{fill:var(--ink);font-family:var(--body);font-size:12.5px}
+.dg-t-b{fill:var(--ink);font-family:var(--body);font-size:13px;font-weight:650}
+.dg-t-m{fill:var(--muted);font-family:var(--mono);font-size:10px;letter-spacing:.06em}
+.dg-line{stroke:var(--muted);fill:none;stroke-width:1.2}
+.dg-line-a{stroke:var(--accent);fill:none;stroke-width:1.6}
+.dg-fill-a{fill:var(--accent)}
+.dg-fill-m{fill:var(--muted)}
+.dg-ok{fill:var(--ok)}
+.dg-crit{fill:var(--crit)}
+
+footer{margin-top:72px;padding-top:22px;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+
+a:focus-visible,.toc a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#s1"><span class="tocnum">01</span>The problem</a></li>
+    <li><a href="#s2"><span class="tocnum">02</span>What already exists</a></li>
+    <li><a href="#s3"><span class="tocnum">03</span>What the kernel will tell us</a></li>
+    <li><a href="#s4"><span class="tocnum">04</span>Architecture</a></li>
+    <li><a href="#s5"><span class="tocnum">05</span>Attribution</a></li>
+    <li><a href="#s6"><span class="tocnum">06</span>Data model</a></li>
+    <li><a href="#s7"><span class="tocnum">07</span>Detection</a></li>
+    <li><a href="#s8"><span class="tocnum">08</span>Tokens, cost, PRs</a></li>
+    <li><a href="#s9"><span class="tocnum">09</span>Surfaces</a></li>
+    <li><a href="#s10"><span class="tocnum">10</span>Build order</a></li>
+    <li><a href="#s11"><span class="tocnum">11</span>Risks &amp; decisions</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="mast">
+  <p class="eyebrow">Design document · ai-obs</p>
+  <h1>Meter</h1>
+  <p class="standfirst">A local-first observability daemon for AI coding agents. Every tool call gets a CPU-time and peak-memory number attached to it, grouped by the project the agent is working in — so when one of eight Claude Code windows starts eating the machine, you know which one, and which command did it.</p>
+  <div class="meta">
+    <span><b>Status</b> Draft for review</span>
+    <span><b>Date</b> 12 Aug 2026</span>
+    <span><b>Scope</b> Claude Code on macOS first</span>
+    <span><b>Repo</b> ~/work/ai-obs</span>
+  </div>
+</header>
+
+<!-- ===================================================== 1 -->
+<h2 id="s1"><span class="num">01</span>The problem</h2>
+
+<p class="lede">You run many Claude Code instances at once. Some of them go bad — a test suite that never exits, a dev server left running, a language server that leaks until the machine swaps. Right now the only instrument is Activity Monitor, which shows you a <code>node</code> process at 400% CPU and tells you nothing about which agent, which project, or which command spawned it.</p>
+
+<h3>What this has to answer</h3>
+<ul>
+  <li><b>Which agent is hurting me?</b> Rank live sessions by CPU and memory, labelled with the project directory and git branch, not a PID.</li>
+  <li><b>What did it run?</b> Every tool call — every <code>Bash</code> invocation, every MCP call — with wall time, CPU time, and peak memory of everything it spawned.</li>
+  <li><b>What leaked?</b> Processes still alive after the tool call that started them returned. This is the single highest-value signal here, and nothing today reports it.</li>
+  <li><b>What did it cost?</b> Token breakdown by input / output / cache-read / cache-creation, by model, by project.</li>
+  <li><b>Optionally, per PR.</b> Which branch and pull request the work belonged to.</li>
+</ul>
+
+<h3>Non-goals</h3>
+<ul>
+  <li>Not a hosted service. Everything stays on the machine; no account, no upload. (A shipper is a later, opt-in add-on.)</li>
+  <li>Not a replacement for <code>ccusage</code> / <code>usage-fyi</code> on the pricing side — token→dollar conversion is a solved problem worth reusing.</li>
+  <li>Not a profiler. We attribute resources to tool calls; we do not tell you which line of your test suite is slow.</li>
+  <li>Not a supervisor, at first. Kill actions are proposed in phase 3 and are always operator-initiated.</li>
+</ul>
+
+<div class="note">
+  <span class="tag">Framing</span>
+  <p>Token accounting is a <i>read the log files</i> problem and is already well served. Resource accounting is a <i>hold a handle on a live process tree</i> problem and is not served at all. This project is mostly the second thing, with the first bolted on so that one screen answers both questions.</p>
+</div>
+
+<!-- ===================================================== 2 -->
+<h2 id="s2"><span class="num">02</span>What already exists</h2>
+
+<p>I went and checked rather than assumed. Three things already exist that this design should stand on.</p>
+
+<h3>Claude Code ships a large OpenTelemetry surface</h3>
+<p>Enabled with <code>CLAUDE_CODE_ENABLE_TELEMETRY=1</code> plus exporter env vars. It emits metrics, log-events, and (in beta) traces. The parts that matter here:</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Signal</th><th>Gives us</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><code>claude_code.token.usage</code></td><td>Tokens by <code>type</code> (input/output/cacheRead/cacheCreation), <code>model</code>, <code>query_source</code> (main/subagent/auxiliary), <code>agent.name</code>, <code>skill.name</code>, <code>mcp_tool.name</code></td><td><span class="pill p-ok">Reuse</span></td></tr>
+<tr><td><code>claude_code.cost.usage</code></td><td>USD, already priced, same dimensions</td><td><span class="pill p-ok">Reuse</span></td></tr>
+<tr><td><code>claude_code.tool_result</code> event</td><td><code>tool_name</code>, <code>tool_use_id</code>, <code>success</code>, <code>duration_ms</code>, input/result sizes</td><td><span class="pill p-ok">Reuse</span></td></tr>
+<tr><td><code>claude_code.api_request</code> event</td><td>Per-request <code>cost_usd_micros</code>, <code>duration_ms</code>, token split, <code>request_id</code></td><td><span class="pill p-ok">Reuse</span></td></tr>
+<tr><td>Traces (beta)</td><td>Spans <code>claude_code.interaction</code>, <code>.llm_request</code>, <code>.tool</code>, <code>.tool.execution</code>, <code>.hook</code></td><td><span class="pill p-warn">Beta</span></td></tr>
+<tr><td>Standard attributes</td><td><code>session.id</code>, <code>user.id</code>, <code>organization.id</code>, <code>terminal.type</code>, <code>app.version</code></td><td><span class="pill p-crit">No cwd</span></td></tr>
+</tbody></table></div>
+<figcaption>Source: code.claude.com/docs/en/monitoring-usage, read 12 Aug 2026.</figcaption>
+</figure>
+
+<div class="note risk">
+  <span class="tag">The gap that decides the architecture</span>
+  <p>OTel carries <code>session.id</code> but <b>no working directory and no git branch</b>. The whole point of this tool is grouping by project, so OTel alone cannot be the spine. You would have to set <code>OTEL_RESOURCE_ATTRIBUTES</code> in every project's <code>.claude/settings.json</code> — per-repo config for something that should just work. The session transcripts, by contrast, stamp <code>cwd</code> and <code>gitBranch</code> on <i>every single record</i>.</p>
+</div>
+
+<h3>The transcripts are richer than the metrics</h3>
+<p>I parsed a real session out of <code>~/.claude/projects/</code> (495 project directories on this machine). Every record carries <code>sessionId</code>, <code>cwd</code>, <code>gitBranch</code>, <code>version</code>, <code>timestamp</code>, <code>uuid</code>/<code>parentUuid</code>. Record types seen in one session:</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Record type</th><th class="num">Count</th><th>Carries</th></tr></thead>
+<tbody>
+<tr><td><code>assistant</code></td><td class="num">534</td><td><code>message.model</code>, full <code>usage</code> block (input, output, cache_creation, cache_read, service_tier, speed), <code>requestId</code>, tool_use blocks</td></tr>
+<tr><td><code>user</code></td><td class="num">271</td><td><code>toolUseResult</code>, <code>promptId</code>, <code>sourceToolUseID</code></td></tr>
+<tr><td><code>attachment</code></td><td class="num">785</td><td>hook executions with <code>hookName</code>, <code>exitCode</code>, <code>durationMs</code>, <code>command</code></td></tr>
+<tr><td><code>pr-link</code></td><td class="num">76</td><td><code>prNumber</code>, <code>prUrl</code>, <code>prRepository</code>, <code>sessionId</code></td></tr>
+<tr><td><code>system</code></td><td class="num">41</td><td><code>subtype: turn_duration</code>, <code>durationMs</code>, <code>messageCount</code></td></tr>
+<tr><td><code>file-history-snapshot</code></td><td class="num">24</td><td>tracked file backups per message</td></tr>
+</tbody></table></div>
+<figcaption>One session, 2,090 records. Also present: <code>attributionSkill</code>, <code>attributionMcpServer</code>, <code>attributionMcpTool</code>, <code>isSidechain</code> (subagent marker).</figcaption>
+</figure>
+
+<div class="note finding">
+  <span class="tag">Finding — the optional feature is free</span>
+  <p>Claude Code already writes <code>pr-link</code> records tying a session to <code>prNumber</code>, <code>prUrl</code>, and <code>prRepository</code>. Per-PR grouping — the part flagged as optional — is a join, not a feature. Combined with <code>gitBranch</code> on every record, PR attribution costs essentially nothing.</p>
+</div>
+
+<h3>Prior art, ours and the community's</h3>
+<ul>
+  <li><b><code>~/work/usage-fyi</code> and <code>-internal</code>.</b> The CLI delegates collection to <code>ccusage</code> (pinned at 20.0.4) and normalises the result into a <code>Snapshot</code> via a small <code>UsageAdapter</code> interface. That adapter shape is the right seam to copy: <code>{ id, available(), collect(), toSnapshot() }</code>. The token maths and model pricing are worth lifting wholesale; the sharing/rendering half is not relevant here.</li>
+  <li><b>Community stacks.</b> <code>ColeMurray/claude-code-otel</code>, SigNoz, and the Grafana write-ups all wire the same pipeline: Claude Code → OTel Collector → Prometheus → Grafana. They all stop at tokens, cost, lines-of-code, and session counts. None of them touch process resources.</li>
+</ul>
+
+<h3>Build or buy</h3>
+<p>Buy would mean OTel Collector + Prometheus + Grafana: three long-running services, a scrape config, a dashboard JSON, and still no answer to the actual question, because no exporter knows that PID 44231 belongs to the Claude Code window in <code>~/work/remin</code>. You would end up writing the process collector anyway, and then feeding it into a stack that is heavier than the thing it monitors.</p>
+<p><b>Recommendation: build, speak OTLP at the edge.</b> One Rust binary, SQLite on disk, its own UI. Ship an optional OTLP <i>exporter</i> so the same data can land in Grafana later, and an optional OTLP <i>receiver</i> so Claude Code's native telemetry can be ingested for cost enrichment. Prometheus and Grafana become integrations, not dependencies.</p>
+
+<!-- ===================================================== 3 -->
+<h2 id="s3"><span class="num">03</span>What the kernel will actually tell us</h2>
+
+<p class="lede">The riskiest assumption in this design is that a normal, unprivileged user process can measure other processes accurately enough. I tested it on this machine (macOS 25.5, Apple Silicon) before writing the rest of the doc. Here is what came back.</p>
+
+<div class="cards">
+  <div class="card">
+    <span class="u">Enumerate all processes</span>
+    <span class="k">1.11 ms</span>
+    <p>827 PIDs with parent links via one <code>sysctl(KERN_PROC_ALL)</code> call. Sampling at 10 Hz costs ~1% of a core.</p>
+  </div>
+  <div class="card">
+    <span class="u">proc_pid_rusage, same uid</span>
+    <span class="k">rc = 0</span>
+    <p>Full counters readable for any process owned by the user, including non-descendants. Root-owned PIDs return −1.</p>
+  </div>
+  <div class="card">
+    <span class="u">Read another process's env</span>
+    <span class="k">blocked</span>
+    <p><code>KERN_PROCARGS2</code> returns argv but strips the environment unprivileged. Rules out one attribution strategy.</p>
+  </div>
+</div>
+
+<h3>The counters we get per process, for free</h3>
+<p><code>proc_pid_rusage(pid, RUSAGE_INFO_V4, …)</code> returns a struct with, among others:</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Field</th><th>Meaning</th><th>Why it matters here</th></tr></thead>
+<tbody>
+<tr><td><code>ri_user_time</code> / <code>ri_system_time</code></td><td>CPU time of the whole task</td><td>The core CPU metric. Monotonic, so deltas are exact.</td></tr>
+<tr><td><code>ri_child_user_time</code> / <code>ri_child_system_time</code></td><td>Cumulative CPU of <b>reaped descendants</b></td><td>Read on the tool's shell, the delta across a tool call is the exact CPU of everything that call spawned and finished. No sampling error.</td></tr>
+<tr><td><code>ri_phys_footprint</code></td><td>Memory as Activity Monitor reports it</td><td>The honest memory number on macOS — better than RSS, which double-counts shared pages.</td></tr>
+<tr><td><code>ri_lifetime_max_phys_footprint</code></td><td>High-water mark for the process's life</td><td>Exact peak memory without sampling, if we read it before the process exits.</td></tr>
+<tr><td><code>ri_diskio_bytesread</code> / <code>byteswritten</code></td><td>Disk I/O bytes</td><td>Distinguishes a compile from a busy-loop.</td></tr>
+<tr><td><code>ri_instructions</code> / <code>ri_cycles</code></td><td>Retired instructions and cycles</td><td>IPC as a cheap "is this thing actually working or spinning" signal.</td></tr>
+<tr><td><code>ri_interrupt_wkups</code>, <code>ri_billed_energy</code></td><td>Wakeups, energy</td><td>Battery impact; a nice-to-have on laptops.</td></tr>
+</tbody></table></div>
+<figcaption>Verified against the live <code>claude</code> process: phys_footprint 256.7 MB, lifetime peak 280.3 MB, 104.2 MB read from disk, child CPU 0.144 s.</figcaption>
+</figure>
+
+<div class="note risk">
+  <span class="tag">Trap — units are not nanoseconds on Apple Silicon</span>
+  <p>The time fields are mach absolute ticks, not nanoseconds. On this machine <code>mach_timebase_info</code> reports <b>125 / 3</b>, i.e. a 24 MHz tick. Reading the <code>claude</code> process raw gave 0.901 "seconds" against <code>ps</code>'s 36.12 s — the naive reading is <b>41.67× too low</b>. Every time field must be multiplied by <code>numer/denom</code>. This is exactly the class of bug that ships silently and makes every number wrong but plausible.</p>
+</div>
+
+<h3>Attribution: what does and does not work</h3>
+<p>Claude Code exports <code>CLAUDE_CODE_SESSION_ID</code>, <code>CLAUDE_PID</code>, <code>CLAUDECODE</code>, and <code>CLAUDE_CODE_ENTRYPOINT</code> into the environment of every process the Bash tool spawns. That inheritance is perfect for attribution — a process 4 levels deep still carries the session ID. The obvious plan is to read those variables from outside.</p>
+
+<p><b>It does not work unprivileged.</b> I spawned a child and tried to read its environment via <code>KERN_PROCARGS2</code>; the syscall succeeds but the kernel returns argv only. <code>ps -Eww</code> on a same-user process returns 9 bytes. macOS restricts environment reads to root. So:</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Strategy</th><th>Precision</th><th>Needs root</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><td>Read <code>CLAUDE_CODE_SESSION_ID</code> from process env</td><td>Exact, survives reparenting</td><td>Yes</td><td><span class="pill p-crit">Rejected</span> for the default path</td></tr>
+<tr><td>PID ancestry walk from the known <code>CLAUDE_PID</code></td><td>Exact while the tree is intact</td><td>No</td><td><span class="pill p-ok">Primary</span></td></tr>
+<tr><td>Sticky PID set — once seen in-tree, keep tracking</td><td>Survives daemonisation / reparent to launchd</td><td>No</td><td><span class="pill p-ok">Primary</span></td></tr>
+<tr><td><code>ri_child_*</code> delta on the tool's shell</td><td>Exact CPU for reaped descendants</td><td>No</td><td><span class="pill p-ok">Primary</span></td></tr>
+<tr><td>Wrap the command via PreToolUse <code>updatedInput</code></td><td>Exact <code>wait4</code> rusage</td><td>No</td><td><span class="pill p-warn">Opt-in only</span> — see below</td></tr>
+<tr><td>eBPF / DTrace process tracing</td><td>Exact, no sampling gap</td><td>Yes (SIP)</td><td><span class="pill p-crit">Rejected</span> on macOS; revisit on Linux</td></tr>
+</tbody></table></div>
+</figure>
+
+<div class="note risk">
+  <span class="tag">Why command wrapping is opt-in, not the default</span>
+  <p>Two reasons. First, your <code>~/.claude/settings.json</code> <b>already has a PreToolUse Bash hook that rewrites commands</b> — <code>rtk hook claude</code>. Hooks run in parallel, so two hooks both returning <code>updatedInput</code> for the same tool call is an unresolved conflict, and the loser is silently dropped. Second, the Bash tool runs in a <i>persistent</i> shell: wrapping each command in a subprocess breaks <code>cd</code> and <code>export</code> persistence, and mangles pipelines, background jobs, and heredocs. The sampler gets us 95% of the value with none of that blast radius.</p>
+</div>
+
+<h3>What the sampler cannot see</h3>
+<ul>
+  <li><b>Sub-sample-interval processes.</b> A process that lives 40 ms between two 100 ms samples is invisible to the sampler. It is <i>not</i> invisible to the <code>ri_child_*</code> delta, which is why we use both — the delta catches aggregate CPU, the sampler catches identity and memory.</li>
+  <li><b>Detached grandchildren spawned and orphaned between samples.</b> Rare; mitigated by the sticky PID set and by matching process start-time against open tool spans.</li>
+  <li><b>Threads.</b> We report per-process, not per-thread. Fine for the stated problem.</li>
+</ul>
+
+<!-- ===================================================== 4 -->
+<h2 id="s4"><span class="num">04</span>Architecture</h2>
+
+<p class="lede">One daemon, four inputs, one store. The daemon is the only long-lived process; the CLI and UI are thin clients over the same SQLite file.</p>
+
+<figure>
+<svg class="diagram" viewBox="0 0 920 470" role="img" aria-labelledby="archtitle">
+<title id="archtitle">Architecture: producers feed the meterd daemon, which writes SQLite and serves the UI</title>
+
+<text x="0" y="14" class="dg-t-m">PRODUCERS</text>
+<text x="330" y="14" class="dg-t-m">METERD — ONE PROCESS</text>
+<text x="742" y="14" class="dg-t-m">CONSUMERS</text>
+
+<!-- producers -->
+<rect x="0" y="30" width="230" height="62" rx="5" class="dg-box"/>
+<text x="16" y="53" class="dg-t-b">Claude Code hooks</text>
+<text x="16" y="72" class="dg-t">SessionStart, Pre/PostToolUse,</text>
+<text x="16" y="87" class="dg-t">SubagentStart/Stop, SessionEnd</text>
+
+<rect x="0" y="108" width="230" height="62" rx="5" class="dg-box"/>
+<text x="16" y="131" class="dg-t-b">Transcripts</text>
+<text x="16" y="150" class="dg-t">~/.claude/projects/**/*.jsonl</text>
+<text x="16" y="165" class="dg-t">tailed, not polled</text>
+
+<rect x="0" y="186" width="230" height="62" rx="5" class="dg-box"/>
+<text x="16" y="209" class="dg-t-b">Kernel</text>
+<text x="16" y="228" class="dg-t">sysctl KERN_PROC_ALL</text>
+<text x="16" y="243" class="dg-t">proc_pid_rusage V4</text>
+
+<rect x="0" y="264" width="230" height="62" rx="5" class="dg-box-2"/>
+<text x="16" y="287" class="dg-t-b">OTLP in (optional)</text>
+<text x="16" y="306" class="dg-t">native Claude Code telemetry</text>
+<text x="16" y="321" class="dg-t">for priced cost</text>
+
+<!-- arrows in -->
+<path d="M232 61 H 296" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M232 139 H 296" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M232 217 H 296" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M232 295 H 296" class="dg-line" marker-end="url(#ahm)" stroke-dasharray="3 3"/>
+
+<defs>
+  <marker id="ah" markerWidth="7" markerHeight="7" refX="6" refY="3.2" orient="auto">
+    <path d="M0,0 L6,3.2 L0,6.4 z" class="dg-fill-a"/></marker>
+  <marker id="ahm" markerWidth="7" markerHeight="7" refX="6" refY="3.2" orient="auto">
+    <path d="M0,0 L6,3.2 L0,6.4 z" class="dg-fill-m"/></marker>
+</defs>
+
+<!-- daemon -->
+<rect x="300" y="30" width="400" height="378" rx="7" class="dg-accent" fill-opacity="0.35"/>
+
+<rect x="318" y="48" width="176" height="56" rx="5" class="dg-box"/>
+<text x="330" y="70" class="dg-t-b">HTTP hook endpoint</text>
+<text x="330" y="88" class="dg-t">127.0.0.1, no fork/call</text>
+
+<rect x="506" y="48" width="176" height="56" rx="5" class="dg-box"/>
+<text x="518" y="70" class="dg-t-b">Transcript tailer</text>
+<text x="518" y="88" class="dg-t">tokens · branch · PR</text>
+
+<rect x="318" y="120" width="176" height="56" rx="5" class="dg-box"/>
+<text x="330" y="142" class="dg-t-b">Sampler · 10 Hz</text>
+<text x="330" y="160" class="dg-t">tree walk + rusage</text>
+
+<rect x="506" y="120" width="176" height="56" rx="5" class="dg-box"/>
+<text x="518" y="142" class="dg-t-b">Detector</text>
+<text x="518" y="160" class="dg-t">leak · runaway · orphan</text>
+
+<rect x="318" y="192" width="364" height="58" rx="5" class="dg-box"/>
+<text x="330" y="215" class="dg-t-b">Correlator</text>
+<text x="330" y="234" class="dg-t">session → project → turn → tool call → process subtree</text>
+
+<rect x="318" y="266" width="364" height="58" rx="5" class="dg-box"/>
+<text x="330" y="289" class="dg-t-b">Aggregator — collapse on close</text>
+<text x="330" y="308" class="dg-t">in-memory samples → one row per process per tool call</text>
+
+<rect x="318" y="340" width="364" height="52" rx="5" class="dg-box-2"/>
+<text x="330" y="363" class="dg-t-b">SQLite (WAL) + 1 Hz session rollup</text>
+<text x="330" y="381" class="dg-t">~/.local/share/meter/meter.db</text>
+
+<path d="M406 106 V 118" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M594 106 V 118" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M406 178 V 190" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M594 178 V 190" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M500 252 V 264" class="dg-line-a" marker-end="url(#ah)"/>
+<path d="M500 326 V 338" class="dg-line-a" marker-end="url(#ah)"/>
+
+<!-- consumers -->
+<path d="M702 366 H 736" class="dg-line-a" marker-end="url(#ah)"/>
+<rect x="740" y="30" width="180" height="58" rx="5" class="dg-box"/>
+<text x="754" y="53" class="dg-t-b">meter top</text>
+<text x="754" y="71" class="dg-t">live TUI, ranked</text>
+
+<rect x="740" y="102" width="180" height="58" rx="5" class="dg-box"/>
+<text x="754" y="125" class="dg-t-b">Web dashboard</text>
+<text x="754" y="143" class="dg-t">project · session · PR</text>
+
+<rect x="740" y="174" width="180" height="58" rx="5" class="dg-box"/>
+<text x="754" y="197" class="dg-t-b">meter report</text>
+<text x="754" y="215" class="dg-t">JSON / markdown</text>
+
+<rect x="740" y="246" width="180" height="58" rx="5" class="dg-box-2"/>
+<text x="754" y="269" class="dg-t-b">OTLP out (optional)</text>
+<text x="754" y="287" class="dg-t">Grafana, SigNoz</text>
+
+<rect x="740" y="318" width="180" height="58" rx="5" class="dg-box-2"/>
+<text x="754" y="341" class="dg-t-b">Alerts</text>
+<text x="754" y="359" class="dg-t">notify, never auto-kill</text>
+
+<path d="M736 366 V 59 H 738" class="dg-line" fill="none"/>
+<path d="M736 131 H 738" class="dg-line" marker-end="url(#ahm)"/>
+<path d="M736 203 H 738" class="dg-line" marker-end="url(#ahm)"/>
+<path d="M736 275 H 738" class="dg-line" marker-end="url(#ahm)"/>
+<path d="M736 347 H 738" class="dg-line" marker-end="url(#ahm)"/>
+</svg>
+<figcaption>Solid lines are required paths; dashed are optional integrations. The daemon is the only component that must be running.</figcaption>
+</figure>
+
+<h3>Components</h3>
+
+<h4>The hook endpoint — HTTP, not command</h4>
+<p>Claude Code supports <code>"type": "http"</code> hooks. This matters more than it looks: a command hook forks a process on <b>every single tool call</b>, in every session. At eight concurrent agents that is a constant drizzle of process spawns — an observability tool that measurably degrades the thing it observes. An HTTP POST to a listener on loopback costs microseconds and no fork. Non-2xx and timeouts are treated as non-blocking errors by Claude Code, so if the daemon is down, your agents keep working and simply go unobserved.</p>
+
+<pre><code><span class="c-com">// ~/.claude/settings.json — installed by `meter install`</span>
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [
+      { "type": "command", "command": "meter session-start", "async": true, "timeout": 5 }]}],
+    "PreToolUse":   [{ "matcher": "*", "hooks": [
+      { "type": "http", "url": "http://127.0.0.1:8770/h/pre",  "timeout": 5 }]}],
+    "PostToolUse":  [{ "matcher": "*", "hooks": [
+      { "type": "http", "url": "http://127.0.0.1:8770/h/post", "timeout": 5 }]}],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [
+      { "type": "http", "url": "http://127.0.0.1:8770/h/post", "timeout": 5 }]}],
+    "SubagentStart": [{ "hooks": [{ "type": "http", "url": "http://127.0.0.1:8770/h/sub" }]}],
+    "SubagentStop":  [{ "hooks": [{ "type": "http", "url": "http://127.0.0.1:8770/h/sub" }]}],
+    "SessionEnd":    [{ "hooks": [{ "type": "http", "url": "http://127.0.0.1:8770/h/end" }]}]
+  }
+}</code></pre>
+
+<p><code>SessionStart</code> is the one exception — a real command hook, run once per session, because it is the only place we can read <code>$CLAUDE_PID</code> from the environment and hand the daemon the root of the process tree. Everything on the hot path is HTTP. Hooks never return a decision, so they can never block or deny a tool call; the endpoint always answers <code>200 {}</code>.</p>
+
+<h4>The sampler</h4>
+<p>A 10 Hz loop: one <code>KERN_PROC_ALL</code> sysctl (1.11 ms for 827 processes), build the PID→PPID map, mark every descendant of every registered <code>CLAUDE_PID</code>, union with the sticky set of PIDs seen in-tree before, then <code>proc_pid_rusage</code> each tracked PID. Rate adapts: 10 Hz while any tool span is open, 1 Hz when all sessions are idle, and it backs off automatically if its own CPU exceeds a budget (default 2% of one core).</p>
+
+<h4>The transcript tailer</h4>
+<p>Watches <code>~/.claude/projects/**/*.jsonl</code> with an fsevents watcher plus byte-offset checkpoints, so a restart resumes rather than re-reads. Parses <code>assistant</code> records for the token block, <code>pr-link</code> for PR association, and <code>system/turn_duration</code> for turn timing. This is also the reconciliation path: transcripts are durable, hooks are not, so anything the daemon missed while it was down gets backfilled here.</p>
+
+<h4>Storage</h4>
+<p>Raw samples are never persisted. 10 Hz × ~30 tracked processes × ~100 B is roughly 2.6 GB/day — absurd for a laptop tool. Instead samples live in memory keyed by <code>(tool_span, pid)</code> and collapse to <b>one row per process per tool call</b> when the process exits or the span closes: total CPU, peak footprint, disk bytes, start/end, exit status. Alongside that, a 1 Hz per-session rollup (CPU%, footprint, process count) is written for the "what happened at 3am" timeline. Result: a few MB per active day, in SQLite with WAL so the UI can read while the daemon writes.</p>
+
+<h3>Stack</h3>
+<p>Rust, single static binary, consistent with <code>rtk</code>. Versions checked against crates.io on 12 Aug 2026:</p>
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Crate</th><th class="num">Version</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>tokio</code></td><td class="num">1.53.1</td><td>Runtime</td></tr>
+<tr><td><code>axum</code></td><td class="num">0.8.9</td><td>Hook endpoint + dashboard API</td></tr>
+<tr><td><code>rusqlite</code></td><td class="num">0.40.2</td><td>Store, bundled SQLite</td></tr>
+<tr><td><code>libproc</code></td><td class="num">0.14.11</td><td>Wraps <code>proc_pid_rusage</code>; the tree walk is a direct sysctl to avoid its per-call overhead</td></tr>
+<tr><td><code>ratatui</code></td><td class="num">0.30.2</td><td><code>meter top</code></td></tr>
+<tr><td><code>clap</code></td><td class="num">4.6.6</td><td>CLI</td></tr>
+<tr><td><code>opentelemetry-proto</code></td><td class="num">0.32.0</td><td>Optional OTLP in/out</td></tr>
+</tbody></table></div>
+<figcaption>Per house convention: <code>shell.nix</code> + direnv for toolchain, <code>justfile</code> for <code>just dev / build / test / verify</code>.</figcaption>
+</figure>
+
+<!-- ===================================================== 5 -->
+<h2 id="s5"><span class="num">05</span>Attribution</h2>
+
+<p class="lede">Everything hinges on being able to say: this process belongs to this tool call, in this session, in this project. Five joins, each with a stated fallback.</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Join</th><th>Primary source</th><th>Fallback</th></tr></thead>
+<tbody>
+<tr><td>session → project</td><td><code>cwd</code> in the SessionStart hook payload, resolved to a git toplevel</td><td>Transcript <code>cwd</code>; <code>CwdChanged</code> hook keeps it current</td></tr>
+<tr><td>session → claude PID</td><td><code>$CLAUDE_PID</code> read by the SessionStart command hook</td><td>Match <code>claude</code> processes by start time against session start</td></tr>
+<tr><td>tool call → time window</td><td>PreToolUse / PostToolUse with the same <code>tool_use_id</code></td><td>Unclosed spans close on the next <code>Stop</code> or on session end</td></tr>
+<tr><td>process → session</td><td>Ancestry walk from the session's claude PID</td><td>Sticky set: once observed in-tree, tracked until exit even after reparenting</td></tr>
+<tr><td>process → tool call</td><td>Process start time falls inside an open span for that session</td><td>Under concurrent spans, attribute by the spawning shell's PID; if still ambiguous, mark <code>attribution: session</code> and exclude from per-tool stats</td></tr>
+</tbody></table></div>
+</figure>
+
+<figure>
+<svg class="diagram" viewBox="0 0 900 262" role="img" aria-labelledby="timeline">
+<title id="timeline">A tool call span with sampled child processes and one leaked process outliving it</title>
+
+<text x="0" y="14" class="dg-t-m">ONE BASH TOOL CALL — HOW A LEAK IS DETECTED</text>
+
+<line x1="120" y1="46" x2="120" y2="228" class="dg-line" stroke-dasharray="3 3"/>
+<line x1="560" y1="46" x2="560" y2="228" class="dg-line" stroke-dasharray="3 3"/>
+<text x="122" y="42" class="dg-t-m">PreToolUse</text>
+<text x="562" y="42" class="dg-t-m">PostToolUse</text>
+
+<rect x="120" y="54" width="440" height="24" rx="4" class="dg-accent"/>
+<text x="132" y="71" class="dg-t">tool span · tool_use_id=toolu_01…  ·  Bash("just test")</text>
+
+<rect x="128" y="92" width="424" height="20" rx="3" class="dg-box-2"/>
+<text x="138" y="107" class="dg-t">zsh (persistent shell) — ri_child_* delta = exact CPU of all reaped children</text>
+
+<rect x="146" y="124" width="290" height="20" rx="3" class="dg-box"/>
+<text x="156" y="139" class="dg-t">cargo test — 41.2 s CPU · peak 1.9 GB</text>
+
+<rect x="188" y="156" width="96" height="20" rx="3" class="dg-box"/>
+<text x="198" y="171" class="dg-t">rustc ×12</text>
+
+<rect x="300" y="156" width="42" height="20" rx="3" class="dg-box"/>
+<text x="308" y="171" class="dg-t">ld</text>
+
+<rect x="360" y="188" width="512" height="20" rx="3" class="dg-box"/>
+<rect x="360" y="188" width="200" height="20" rx="3" class="dg-box"/>
+<text x="370" y="203" class="dg-t">node (test dev-server) — never exits</text>
+<circle cx="700" cy="198" r="4" class="dg-crit"/>
+<text x="712" y="202" class="dg-t-m">STILL ALIVE — ORPHAN, FLAGGED</text>
+
+<text x="0" y="107" class="dg-t-m">DEPTH 0</text>
+<text x="0" y="139" class="dg-t-m">1</text>
+<text x="0" y="171" class="dg-t-m">2</text>
+<text x="0" y="203" class="dg-t-m">2</text>
+
+<line x1="0" y1="224" x2="900" y2="224" class="dg-line"/>
+<g class="dg-fill-m">
+<circle cx="130" cy="240" r="2"/><circle cx="170" cy="240" r="2"/><circle cx="210" cy="240" r="2"/>
+<circle cx="250" cy="240" r="2"/><circle cx="290" cy="240" r="2"/><circle cx="330" cy="240" r="2"/>
+<circle cx="370" cy="240" r="2"/><circle cx="410" cy="240" r="2"/><circle cx="450" cy="240" r="2"/>
+<circle cx="490" cy="240" r="2"/><circle cx="530" cy="240" r="2"/><circle cx="570" cy="240" r="2"/>
+<circle cx="610" cy="240" r="2"/><circle cx="650" cy="240" r="2"/><circle cx="690" cy="240" r="2"/>
+<circle cx="730" cy="240" r="2"/><circle cx="770" cy="240" r="2"/><circle cx="810" cy="240" r="2"/>
+</g>
+<text x="836" y="244" class="dg-t-m">10 Hz</text>
+</svg>
+<figcaption>The shell's <code>ri_child_*</code> delta gives exact aggregate CPU even for processes too short-lived to sample. The sampler gives identity, per-process peak memory, and — the point of the exercise — the fact that <code>node</code> outlived its span.</figcaption>
+</figure>
+
+<h3>Subagents</h3>
+<p>Tool events inside a subagent carry <code>agent_id</code> and <code>agent_type</code>, and transcript records carry <code>isSidechain: true</code>. Subagent tool calls are recorded as spans with a parent link, so a project's totals can be broken down main-agent vs. subagent — which matters, since fan-out subagents are a common source of parallel test runs.</p>
+
+<!-- ===================================================== 6 -->
+<h2 id="s6"><span class="num">06</span>Data model</h2>
+
+<p>Six tables. <code>project</code> and <code>session</code> are dimensions; <code>tool_span</code>, <code>proc_stat</code>, <code>session_sample</code>, and <code>llm_usage</code> are facts.</p>
+
+<pre><code><span class="c-key">CREATE TABLE</span> project (
+  id            <span class="c-key">INTEGER PRIMARY KEY</span>,
+  root          <span class="c-key">TEXT UNIQUE NOT NULL</span>,   <span class="c-com">-- git toplevel, else cwd</span>
+  name          <span class="c-key">TEXT NOT NULL</span>,          <span class="c-com">-- basename, shown in every UI</span>
+  repo_remote   <span class="c-key">TEXT</span>                    <span class="c-com">-- owner/name, for PR joins</span>
+);
+
+<span class="c-key">CREATE TABLE</span> session (
+  id            <span class="c-key">TEXT PRIMARY KEY</span>,        <span class="c-com">-- Claude Code sessionId (uuid)</span>
+  project_id    <span class="c-key">INTEGER REFERENCES</span> project(id),
+  claude_pid    <span class="c-key">INTEGER</span>,
+  git_branch    <span class="c-key">TEXT</span>,
+  pr_number     <span class="c-key">INTEGER</span>,                 <span class="c-com">-- from pr-link records</span>
+  pr_url        <span class="c-key">TEXT</span>,
+  cc_version    <span class="c-key">TEXT</span>,
+  entrypoint    <span class="c-key">TEXT</span>,
+  started_at    <span class="c-key">INTEGER NOT NULL</span>,        <span class="c-com">-- unix ms throughout</span>
+  ended_at      <span class="c-key">INTEGER</span>,
+  end_reason    <span class="c-key">TEXT</span>
+);
+
+<span class="c-key">CREATE TABLE</span> tool_span (
+  id            <span class="c-key">INTEGER PRIMARY KEY</span>,
+  session_id    <span class="c-key">TEXT REFERENCES</span> session(id),
+  tool_use_id   <span class="c-key">TEXT</span>,
+  parent_span   <span class="c-key">INTEGER REFERENCES</span> tool_span(id),  <span class="c-com">-- subagent nesting</span>
+  agent_id      <span class="c-key">TEXT</span>, agent_type <span class="c-key">TEXT</span>,
+  tool_name     <span class="c-key">TEXT NOT NULL</span>,          <span class="c-com">-- Bash | Edit | mcp__x__y | …</span>
+  cmd_digest    <span class="c-key">TEXT</span>,                    <span class="c-com">-- normalised command shape, e.g. "just test"</span>
+  cmd_full      <span class="c-key">TEXT</span>,                    <span class="c-com">-- redacted; off by default</span>
+  started_at    <span class="c-key">INTEGER NOT NULL</span>, ended_at <span class="c-key">INTEGER</span>,
+  ok            <span class="c-key">INTEGER</span>,
+  cpu_ns        <span class="c-key">INTEGER</span>,                 <span class="c-com">-- exact: ri_child_* delta on the shell</span>
+  cpu_ns_sampled <span class="c-key">INTEGER</span>,                <span class="c-com">-- sum over proc_stat, for cross-checking</span>
+  peak_footprint <span class="c-key">INTEGER</span>,                <span class="c-com">-- max over tracked descendants</span>
+  disk_read     <span class="c-key">INTEGER</span>, disk_write <span class="c-key">INTEGER</span>,
+  proc_count    <span class="c-key">INTEGER</span>,
+  leaked_count  <span class="c-key">INTEGER</span>                  <span class="c-com">-- descendants still alive at span close</span>
+);
+
+<span class="c-key">CREATE TABLE</span> proc_stat (          <span class="c-com">-- one row per process per span, written on close</span>
+  id            <span class="c-key">INTEGER PRIMARY KEY</span>,
+  span_id       <span class="c-key">INTEGER REFERENCES</span> tool_span(id),
+  session_id    <span class="c-key">TEXT REFERENCES</span> session(id),
+  pid           <span class="c-key">INTEGER</span>, ppid <span class="c-key">INTEGER</span>, depth <span class="c-key">INTEGER</span>,
+  comm          <span class="c-key">TEXT</span>, argv_head <span class="c-key">TEXT</span>,
+  first_seen    <span class="c-key">INTEGER</span>, last_seen <span class="c-key">INTEGER</span>, exited_at <span class="c-key">INTEGER</span>,
+  cpu_user_ns   <span class="c-key">INTEGER</span>, cpu_sys_ns <span class="c-key">INTEGER</span>,
+  peak_footprint <span class="c-key">INTEGER</span>,                <span class="c-com">-- ri_lifetime_max_phys_footprint</span>
+  disk_read     <span class="c-key">INTEGER</span>, disk_write <span class="c-key">INTEGER</span>,
+  instructions  <span class="c-key">INTEGER</span>, cycles <span class="c-key">INTEGER</span>,
+  attribution   <span class="c-key">TEXT NOT NULL</span>,          <span class="c-com">-- 'span' | 'session' (ambiguous)</span>
+  orphaned      <span class="c-key">INTEGER NOT NULL DEFAULT</span> 0
+);
+
+<span class="c-key">CREATE TABLE</span> session_sample (     <span class="c-com">-- 1 Hz rollup, the timeline</span>
+  session_id    <span class="c-key">TEXT</span>, t <span class="c-key">INTEGER</span>,
+  cpu_pct       <span class="c-key">REAL</span>, footprint <span class="c-key">INTEGER</span>, proc_count <span class="c-key">INTEGER</span>,
+  <span class="c-key">PRIMARY KEY</span> (session_id, t)
+) <span class="c-key">WITHOUT ROWID</span>;
+
+<span class="c-key">CREATE TABLE</span> llm_usage (          <span class="c-com">-- one row per assistant message</span>
+  session_id    <span class="c-key">TEXT REFERENCES</span> session(id),
+  message_uuid  <span class="c-key">TEXT PRIMARY KEY</span>,
+  request_id    <span class="c-key">TEXT</span>, ts <span class="c-key">INTEGER</span>,
+  model         <span class="c-key">TEXT</span>, query_source <span class="c-key">TEXT</span>, is_sidechain <span class="c-key">INTEGER</span>,
+  input_tokens  <span class="c-key">INTEGER</span>, output_tokens <span class="c-key">INTEGER</span>,
+  cache_read    <span class="c-key">INTEGER</span>, cache_creation <span class="c-key">INTEGER</span>,
+  cost_usd      <span class="c-key">REAL</span>,                    <span class="c-com">-- OTLP if available, else priced locally</span>
+  cost_source   <span class="c-key">TEXT</span>                     <span class="c-com">-- 'otel' | 'computed'</span>
+);</code></pre>
+
+<p>Retention: <code>proc_stat</code> rows for processes under a CPU/memory floor are dropped after 7 days; <code>session_sample</code> downsamples to 1-minute buckets after 24 hours; <code>tool_span</code> and <code>llm_usage</code> are kept indefinitely (they are small). Defaults, all configurable.</p>
+
+<h3>Privacy</h3>
+<p>Commands are stored as a <b>digest</b> by default — argv[0] plus a normalised shape (<code>just test</code>, <code>cargo test …</code>), never the full string with its flags and paths. Full command capture is opt-in per project. Environment variables are never read or stored. Nothing leaves the machine unless an OTLP endpoint is explicitly configured. That is not just a policy choice: with the env-read path blocked by the kernel, the daemon has no mechanism to see secrets even if it wanted to.</p>
+
+<!-- ===================================================== 7 -->
+<h2 id="s7"><span class="num">07</span>Detection</h2>
+
+<p class="lede">Data nobody reads is worthless. Four detectors run against live state and raise a finding with the project name, the session, and the offending command.</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Detector</th><th>Rule</th><th>Reports</th></tr></thead>
+<tbody>
+<tr>
+  <td><span class="pill p-crit">Orphan</span></td>
+  <td>Process still alive <code>N</code> seconds after the tool span that spawned it closed, and not a known long-lived helper (language servers, watchers, on an allowlist)</td>
+  <td>"<code>node</code> from <code>just test</code> in <b>remin</b> has outlived its tool call by 14 min, 1.2 GB"</td>
+</tr>
+<tr>
+  <td><span class="pill p-crit">Leak</span></td>
+  <td>Footprint monotonically non-decreasing across a 10-minute window with a positive slope above a threshold and no plateau; applied to the <code>claude</code> process itself as well as descendants</td>
+  <td>"Session in <b>floorplan-app</b>: +180 MB/hr sustained, now 3.1 GB"</td>
+</tr>
+<tr>
+  <td><span class="pill p-warn">Runaway CPU</span></td>
+  <td>&gt;90% of a core sustained for <code>N</code> minutes inside a single tool span, with low disk I/O and high IPC — the spin-loop signature, as distinct from a legitimately busy compile</td>
+  <td>"Tool call in <b>harness</b> at 780% CPU for 6 min, no I/O"</td>
+</tr>
+<tr>
+  <td><span class="pill p-warn">Contention</span></td>
+  <td>Sum of tracked CPU across all sessions exceeds core count, or total footprint exceeds a fraction of physical RAM</td>
+  <td>"5 sessions, 11.2 cores requested on 10 cores. Heaviest: <b>ai-obs</b>, <b>remin</b>"</td>
+</tr>
+</tbody></table></div>
+</figure>
+
+<p>Findings surface in <code>meter top</code>, on the dashboard, and — opt-in — as a macOS notification. <b>No automatic killing.</b> The tool proposes <code>meter kill &lt;finding-id&gt;</code>, which terminates the process subtree and records that it did. Killing something a coding agent is mid-way through is a good way to corrupt a working tree, and a monitor that does it on a heuristic is worse than no monitor.</p>
+
+<div class="note">
+  <span class="tag">Calibration</span>
+  <p>All four thresholds start as guesses. Phase 1 ships with detection running in log-only mode; the thresholds get set from a week of the operator's own real data before anything raises a notification. A monitor that cries wolf in week one gets uninstalled in week two.</p>
+</div>
+
+<!-- ===================================================== 8 -->
+<h2 id="s8"><span class="num">08</span>Tokens, cost, and PRs</h2>
+
+<h3>Tokens</h3>
+<p>The transcript tailer reads the <code>usage</code> block off every <code>assistant</code> record: <code>input_tokens</code>, <code>output_tokens</code>, <code>cache_creation_input_tokens</code>, <code>cache_read_input_tokens</code>, plus <code>model</code>, <code>service_tier</code>, and <code>speed</code>. Because the record also carries <code>cwd</code>, <code>gitBranch</code>, <code>sessionId</code>, and <code>isSidechain</code>, the grouping the brief asks for — <b>by project</b> — falls out of a single pass with no extra configuration. That is the concrete reason the tailer is the spine and OTLP is the optional enrichment.</p>
+
+<h3>Cost</h3>
+<p>Two sources, and we record which one was used. If the OTLP receiver is enabled, take Claude Code's own <code>cost_usd_micros</code> — authoritative, already priced, handles subscription vs. API. Otherwise compute locally from tokens × a model price table, the same approach <code>ccusage</code> takes and the same one <code>usage-fyi</code>'s adapter already depends on. The price table is refreshed on demand and cached; a stale table is reported as stale rather than silently producing wrong dollars.</p>
+
+<h3>PRs</h3>
+<p>Cheaper than expected. <code>pr-link</code> records in the transcript give <code>prNumber</code>, <code>prUrl</code>, and <code>prRepository</code> directly against a <code>sessionId</code>. For sessions with no <code>pr-link</code> record, fall back to branch: every record carries <code>gitBranch</code>, and <code>gh pr list --head &lt;branch&gt;</code> resolves it. A PR view then aggregates every session that touched that branch: total tokens, total cost, total CPU-hours, peak memory, longest tool calls, and any orphans left behind. "This PR cost $14 and 3.2 CPU-hours" is a genuinely new number.</p>
+
+<div class="note">
+  <span class="tag">Worth noting</span>
+  <p>Sessions move between branches mid-flight — the sampled transcript showed <code>gitBranch</code> changing from <code>main</code> to <code>fix/release-ci</code> within one session. Branch must therefore be recorded <b>per record</b>, not per session, and PR attribution must be a many-to-many join. Getting this wrong would silently misattribute cost.</p>
+</div>
+
+<!-- ===================================================== 9 -->
+<h2 id="s9"><span class="num">09</span>Surfaces</h2>
+
+<div class="cards">
+  <div class="card">
+    <h5><code>meter top</code></h5>
+    <p>The one that earns the project. Live, ranked by whatever is hurting: project name, branch, CPU%, footprint, process count, the currently-running tool call, and a severity stripe. Drill into a row for the live process tree.</p>
+  </div>
+  <div class="card">
+    <h5>Dashboard</h5>
+    <p>Localhost web UI. Project leaderboard by CPU-hours and cost; session timeline with tool spans over CPU and memory bands; the tool-call table sorted by cost or by CPU; findings feed.</p>
+  </div>
+  <div class="card">
+    <h5><code>meter report</code></h5>
+    <p>JSON or markdown for a project, session, or PR. Scriptable, and how this data reaches a PR comment or a weekly summary.</p>
+  </div>
+  <div class="card">
+    <h5><code>meter doctor</code></h5>
+    <p>Verifies hooks are installed and firing, the daemon is up, the mach timebase conversion matches <code>ps</code>, and sampler overhead is within budget. The self-check that keeps the numbers trustworthy.</p>
+  </div>
+</div>
+
+<p>The dashboard's default view should answer the opening question in one screen: <b>a leaderboard of live sessions by resource use, labelled by project, with findings at the top.</b> Everything historical is a click away, not the front page.</p>
+
+<!-- ===================================================== 10 -->
+<h2 id="s10"><span class="num">10</span>Build order</h2>
+
+<p>Each phase is independently useful. If the project stops after phase 1, phase 1 is still worth having.</p>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Phase</th><th>Ships</th><th>Proves</th></tr></thead>
+<tbody>
+<tr>
+  <td><b>0 — Spike</b></td>
+  <td>Rust sampler that walks a given <code>claude</code> PID's tree at 10 Hz and prints per-process CPU and footprint. Cross-check totals against <code>ps</code> and <code>/usr/bin/time</code>.</td>
+  <td>Timebase conversion is right and overhead is inside budget. Everything else depends on this being correct, so it gets validated first.</td>
+</tr>
+<tr>
+  <td><b>1 — Core</b></td>
+  <td>Daemon: HTTP hook endpoint, SessionStart shim, sampler, correlator, SQLite, <code>meter top</code>, <code>meter install</code>, <code>meter doctor</code>. Detectors run log-only.</td>
+  <td>The original question — "which agent is eating my machine and what is it running" — is answerable.</td>
+</tr>
+<tr>
+  <td><b>2 — Tokens</b></td>
+  <td>Transcript tailer, <code>llm_usage</code>, local pricing, project rollups, web dashboard.</td>
+  <td>One screen for resources and spend, grouped by project.</td>
+</tr>
+<tr>
+  <td><b>3 — Findings</b></td>
+  <td>Detectors live with calibrated thresholds, notifications, <code>meter kill</code>, orphan reaping.</td>
+  <td>The tool tells you rather than waiting to be asked.</td>
+</tr>
+<tr>
+  <td><b>4 — PRs &amp; integrations</b></td>
+  <td>PR view, <code>meter report</code>, OTLP in/out, optional Linux support via cgroup v2.</td>
+  <td>Per-PR cost accounting; a path off macOS.</td>
+</tr>
+</tbody></table></div>
+</figure>
+
+<!-- ===================================================== 11 -->
+<h2 id="s11"><span class="num">11</span>Risks and open decisions</h2>
+
+<figure>
+<div class="scroll"><table>
+<thead><tr><th>Risk</th><th>Severity</th><th>Mitigation</th></tr></thead>
+<tbody>
+<tr><td>Mach timebase mis-conversion silently produces plausible-but-wrong CPU numbers</td><td><span class="pill p-crit">High</span></td><td>Phase 0 validates against <code>ps</code> and <code>/usr/bin/time</code>; <code>meter doctor</code> re-checks continuously</td></tr>
+<tr><td>Hook config collision — <code>rtk hook claude</code> already rewrites Bash commands</td><td><span class="pill p-crit">High</span></td><td>Never return <code>updatedInput</code>; observe only. <code>meter install</code> merges into existing hook arrays rather than overwriting, and <code>meter doctor</code> reports conflicts</td></tr>
+<tr><td>Sampler misses short-lived processes</td><td><span class="pill p-warn">Med</span></td><td><code>ri_child_*</code> delta catches their CPU; per-process identity for &lt;100 ms processes is accepted as lost</td></tr>
+<tr><td>Concurrent tool spans make process→span attribution ambiguous</td><td><span class="pill p-warn">Med</span></td><td>Spawning-shell PID disambiguates; otherwise degrade to session-level attribution and mark it, rather than guessing</td></tr>
+<tr><td>Claude Code changes its transcript format</td><td><span class="pill p-warn">Med</span></td><td>Tailer is version-aware (<code>version</code> on every record), tolerates unknown types, and never crashes the daemon on a parse failure</td></tr>
+<tr><td>Observer overhead becomes the problem it diagnoses</td><td><span class="pill p-warn">Med</span></td><td>Self-metering with a hard CPU budget and automatic backoff; HTTP hooks instead of per-call forks</td></tr>
+<tr><td>Long-lived helpers (LSPs, watchers) look like leaks</td><td><span class="pill p-ok">Low</span></td><td>Allowlist plus a learned baseline per project before findings go live</td></tr>
+</tbody></table></div>
+</figure>
+
+<h3>Open decisions for you</h3>
+<ol>
+  <li><b>Name.</b> The doc uses <code>meter</code> / <code>meterd</code> against the repo name <code>ai-obs</code>. Pick one before the first commit — this is the cheapest it will ever be to change.</li>
+  <li><b>Sampler floor.</b> 10 Hz while active is my proposal. Higher catches more short processes at more cost; 5 Hz is defensible if overhead measures worse than expected in phase 0.</li>
+  <li><b>Command capture.</b> Digest-only by default, full commands opt-in. If you want full commands globally, say so now — it changes the redaction design, not just a flag.</li>
+  <li><b>OTLP receiver in phase 2 or phase 4?</b> Turning it on gets authoritative cost immediately, at the price of asking you to set telemetry env vars. Local pricing avoids that but can drift.</li>
+  <li><b>Linux.</b> Worth designing the collector trait against cgroup v2 from the start, or leave the abstraction until it's actually needed?</li>
+</ol>
+
+<footer>
+  ai-obs design draft · 12 Aug 2026 · measurements taken on macOS 25.5, Apple Silicon, Claude Code 2.1.177 · all kernel behaviour in §3 verified empirically, not assumed
+</footer>
+
+</main>
+</div>
