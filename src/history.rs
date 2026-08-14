@@ -653,6 +653,7 @@ pub fn build_session(store: &Store, id: &str) -> Result<Option<Value>> {
                 "started_at": a.started_at,
                 "ended_at": a.ended_at,
                 "end_reason": a.end_reason,
+                "title": a.title,
             })
         })
         .collect();

@@ -183,3 +183,50 @@ and load-bearing — this is not a changelog.
   dominant-binary CTE added no measurable overhead (~890ms before and
   after, days=30) — `proc_stat` is small enough that the extra grouped
   join is noise next to the `llm_usage` scan.
+
+- **Task/subagent transcript correlation (verified 2026-08-14 against real
+  `~/.claude/projects/**/*.jsonl` on this machine)**: this account's own
+  transcripts are written by an Agent-SDK-style harness that names the
+  spawn tool `"Agent"`, not the stock Claude Code CLI's `"Task"` — a
+  parser meant to work across both must accept either `name`. Two record
+  shapes matter, keyed by `tool_use_id`/`tool_use.id`:
+  `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_..",
+  "name":"Task"|"Agent","input":{"description":"<3-5 word title>"}}]}}` and
+  the reply `{"type":"user","message":{"content":[{"type":"tool_result",
+  "tool_use_id":"toolu_..","content":[{"type":"text","text":"...agentId:
+  <hex-id> (internal ID...)..."}]}]},"toolUseResult":{"agentId":"<hex-id>",
+  "description":"..."}}}`. The sibling top-level `toolUseResult.agentId`
+  field is a cleaner, structured source than the prose `agentId:` marker in
+  the text blob and should be preferred, with the text-scan as a fallback
+  (see `tailer.rs::ingest_agent_title`/`extract_agent_id`) — a stock CLI
+  transcript may only populate the latter. `sessionId` is present on every
+  record type (assistant/user/attachment alike), so correlation doesn't
+  need to special-case which record type carries it.
+
+- **Store-side pending-write map for order-independent correlation**: when
+  two independent event streams (an HTTP hook vs. the transcript tailer's
+  ~3s-lagged poll) both need to populate the same row and either can arrive
+  first, don't try to sequence them — give the `Store` a small in-memory
+  `Mutex<HashMap<key, value>>` "pending" side table. The write method
+  (`Store::set_agent_title`) does `UPDATE ... ; if 0 rows affected, stash
+  in pending` and the row-creation method (`Store::open_agent_span`) checks
+  pending for its own key right after inserting and applies+removes it.
+  Caps the map size (drop-the-whole-map past N) so an event whose match
+  never arrives (e.g. a dropped hook) can't leak memory over a long-running
+  daemon — losing a handful of not-yet-matched values is fine when the
+  consumer already has a fallback (agent_type / short id).
+
+- **`ai-obs top`'s `/api/top` sort must not double as the display order**:
+  sorting the session list by a live metric (cpu_pct) server-side, every
+  poll, made rows visually reshuffle on their own even though the TUI
+  already tracked selection by a stable string key (`sess:`/`agent:`/
+  `span:`) rather than row index — the *item* stayed correctly selected,
+  but the whole list dancing under it still reads as broken. Fix: the
+  server always returns a stable order (`started_at DESC`); a client-side
+  sort toggle (`top.rs::compute_session_order`) applies volatile orderings
+  (cpu/mem/cost) but only recomputes at most every 5s, reusing the frozen
+  order (new sessions appended, gone ones dropped) between recomputes.
+  Keep this kind of reordering logic as a pure function of
+  `(sessions, prev_order, mode, now_ms, last_reorder_ms)` — plain integers
+  for the clock inputs, not `Instant` — so the freeze-cadence behavior is
+  directly unit-testable without sleeping in tests.

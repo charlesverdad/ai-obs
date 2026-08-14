@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 pub fn run(once: bool) -> Result<()> {
     if once {
@@ -54,6 +54,165 @@ pub fn fmt_duration(total_secs: f64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// Idle age as whole minutes: `idle 0m`, `idle 42m`. Deliberately coarse
+/// (minutes only, no hours/seconds) — matches the spec for the STATUS
+/// column; `fmt_duration` (h/m/s) is used where finer precision matters
+/// (span/agent TIME columns).
+fn fmt_idle_mins(idle_ms: i64) -> String {
+    format!("idle {}m", idle_ms.max(0) / 60_000)
+}
+
+/// State label for a session/agent row: `running` or `idle Nm`, with a
+/// `\u{b7} N spans` suffix only when there's at least one span — replaces
+/// the old "0 spans" placeholder, which read as a status but was really
+/// just a (frequently zero, hence meaningless) count.
+pub fn fmt_state(running: bool, idle_ms: i64, spans: i64) -> String {
+    let base = if running {
+        "running".to_string()
+    } else {
+        fmt_idle_mins(idle_ms)
+    };
+    if spans > 0 {
+        format!(
+            "{base} \u{b7} {spans} span{}",
+            if spans == 1 { "" } else { "s" }
+        )
+    } else {
+        base
+    }
+}
+
+/// Session/agent list sort. `Recent` trusts the server's own stable order
+/// (started_at desc) and is never client-reordered; the other three are
+/// volatile metrics re-sorted at most every [`REORDER_FREEZE_MS`] — see
+/// [`compute_session_order`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Recent,
+    Cpu,
+    Mem,
+    Cost,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Recent => SortMode::Cpu,
+            SortMode::Cpu => SortMode::Mem,
+            SortMode::Mem => SortMode::Cost,
+            SortMode::Cost => SortMode::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Recent => "recent",
+            SortMode::Cpu => "cpu",
+            SortMode::Mem => "mem",
+            SortMode::Cost => "cost",
+        }
+    }
+}
+
+fn sort_metric(session: &serde_json::Value, mode: SortMode) -> f64 {
+    match mode {
+        SortMode::Recent => 0.0,
+        SortMode::Cpu => f64_of(session, "cpu_pct"),
+        SortMode::Mem => i64_of(session, "footprint_mb") as f64,
+        SortMode::Cost => f64_of(session, "cost_usd"),
+    }
+}
+
+/// Re-sort at most this often for a volatile sort mode (cpu/mem/cost), so
+/// rows don't reshuffle every ~1s refresh tick while the user is navigating.
+const REORDER_FREEZE_MS: i64 = 5_000;
+
+fn session_ids(sessions: &[&serde_json::Value]) -> Vec<String> {
+    sessions
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+fn sorted_refs(sessions: &[serde_json::Value], mode: SortMode) -> Vec<&serde_json::Value> {
+    let mut v: Vec<&serde_json::Value> = sessions.iter().collect();
+    v.sort_by(|a, b| {
+        sort_metric(b, mode)
+            .partial_cmp(&sort_metric(a, mode))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    v
+}
+
+/// Compute the top-level session display order.
+///
+/// - `Recent`: always the payload's own order (server-stable, started_at
+///   desc) — never resorted here.
+/// - `Cpu`/`Mem`/`Cost`: re-sort only when at least [`REORDER_FREEZE_MS`]
+///   has elapsed since the last reorder; otherwise reuse `prev_order`
+///   (filtered to sessions still present, with any newly-appeared sessions
+///   appended in sorted position) so a row already on screen doesn't jump
+///   under the cursor between recomputes.
+///
+/// Returns `(new_order, new_last_reorder_ms)`. Takes plain monotonic
+/// milliseconds rather than `Instant` so it's directly unit-testable.
+pub fn compute_session_order(
+    sessions: &[serde_json::Value],
+    prev_order: &[String],
+    mode: SortMode,
+    now_ms: i64,
+    last_reorder_ms: i64,
+) -> (Vec<String>, i64) {
+    if mode == SortMode::Recent {
+        let refs: Vec<&serde_json::Value> = sessions.iter().collect();
+        return (session_ids(&refs), now_ms);
+    }
+    let due = prev_order.is_empty() || now_ms - last_reorder_ms >= REORDER_FREEZE_MS;
+    if due {
+        return (session_ids(&sorted_refs(sessions, mode)), now_ms);
+    }
+    let present: HashSet<&str> = sessions
+        .iter()
+        .filter_map(|s| s["session_id"].as_str())
+        .collect();
+    let mut order: Vec<String> = prev_order
+        .iter()
+        .filter(|id| present.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let known: HashSet<&str> = order.iter().map(|s| s.as_str()).collect();
+    let newcomers: Vec<serde_json::Value> = sessions
+        .iter()
+        .filter(|s| {
+            s["session_id"]
+                .as_str()
+                .map(|id| !known.contains(id))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let newcomer_refs = sorted_refs(&newcomers, mode);
+    order.extend(session_ids(&newcomer_refs));
+    (order, last_reorder_ms)
+}
+
+/// Rebuild the `top` payload with its `sessions` array reordered per
+/// `order` (session_ids not present in `order` are dropped — shouldn't
+/// happen since `compute_session_order` is derived from the same payload,
+/// but a stale `order` fails safe by simply hiding the row rather than
+/// panicking).
+fn reorder_top(top: &serde_json::Value, order: &[String]) -> serde_json::Value {
+    let sessions = top["sessions"].as_array().cloned().unwrap_or_default();
+    let mut by_id: HashMap<String, serde_json::Value> = sessions
+        .into_iter()
+        .map(|s| (s["session_id"].as_str().unwrap_or("?").to_string(), s))
+        .collect();
+    let ordered: Vec<serde_json::Value> = order.iter().filter_map(|id| by_id.remove(id)).collect();
+    let mut out = top.clone();
+    out["sessions"] = serde_json::Value::Array(ordered);
+    out
 }
 
 // ---------------- tree flattening (pure, unit-testable) ----------------
@@ -112,6 +271,12 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
         let cost = f64_of(sess, "cost_usd");
         let unpriced = i64_of(sess, "unpriced");
         let cpu = f64_of(sess, "cpu_pct");
+        let running = sess
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let idle_ms = i64_of(sess, "idle_ms");
+        let spans = i64_of(sess, "spans");
         out.push(FlatRow {
             key: skey.clone(),
             depth: 0,
@@ -132,7 +297,7 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
             tok_in: fmt_compact(tok_in),
             tok_out: fmt_compact(tok_out),
             cost: fmt_cost(cost, unpriced),
-            current: sess["current_tool"].as_str().unwrap_or("idle").to_string(),
+            current: fmt_state(running, idle_ms, spans),
             warn: cpu > 300.0,
         });
         if !sexpanded {
@@ -148,11 +313,17 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
             let akey = format!("agent:{sid}:{akey_part}");
             let aexpanded = expanded.contains(&akey);
             let agent_type = s_opt(agent, "agent_type");
+            let title = s_opt(agent, "title");
+            // "<agent_type>: <title>" when both are known (e.g. "Explore:
+            // Research subagent hook payloads"); otherwise fall back to
+            // whichever of the two is known, then a short id — never blank.
             let name = match &agent_id {
                 None => "main agent".to_string(),
-                Some(_) => match &agent_type {
-                    Some(t) => format!("{t} (subagent)"),
-                    None => format!("{akey_part} (subagent)"),
+                Some(aid) => match (&agent_type, &title) {
+                    (Some(t), Some(ti)) => format!("{t}: {ti}"),
+                    (None, Some(ti)) => ti.clone(),
+                    (Some(t), None) => format!("{t} (subagent)"),
+                    (None, None) => format!("agent {}", &aid[..aid.len().min(8)]),
                 },
             };
             let a_tok_out = i64_of(agent, "tokens_out");
@@ -172,7 +343,15 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
                 .as_array()
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            let nspans = open_spans.len() + recent_spans.len();
+            let a_running = agent
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let a_idle_ms = i64_of(agent, "idle_ms");
+            let a_spans = agent
+                .get("spans")
+                .and_then(|v| v.as_i64())
+                .unwrap_or((open_spans.len() + recent_spans.len()) as i64);
             out.push(FlatRow {
                 key: akey.clone(),
                 depth: 1,
@@ -186,7 +365,7 @@ pub fn flatten(top: &serde_json::Value, expanded: &HashSet<String>) -> Vec<FlatR
                 tok_in: String::new(),
                 tok_out: fmt_compact(a_tok_out),
                 cost: fmt_cost(a_cost, 0),
-                current: format!("{nspans} span{}", if nspans == 1 { "" } else { "s" }),
+                current: fmt_state(a_running, a_idle_ms, a_spans),
                 warn: false,
             });
             if !aexpanded {
@@ -377,6 +556,13 @@ struct UiState {
     expanded: HashSet<String>,
     seen_sessions: HashSet<String>,
     selected_key: Option<String>,
+    sort_mode: SortMode,
+    session_order: Vec<String>,
+    last_reorder_ms: i64,
+    /// Monotonic clock reference for `compute_session_order`'s `now_ms`
+    /// (that function itself is plain-integer and doesn't touch real time —
+    /// this is the one place a real `Instant` gets turned into millis).
+    clock: Instant,
 }
 
 impl UiState {
@@ -385,7 +571,40 @@ impl UiState {
             expanded: HashSet::new(),
             seen_sessions: HashSet::new(),
             selected_key: None,
+            sort_mode: SortMode::Recent,
+            session_order: Vec::new(),
+            last_reorder_ms: 0,
+            clock: Instant::now(),
         }
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.elapsed().as_millis() as i64
+    }
+
+    /// Cycle the sort mode and force an immediate reorder on the next
+    /// refresh (rather than waiting up to `REORDER_FREEZE_MS`) so switching
+    /// modes feels responsive.
+    fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.last_reorder_ms = i64::MIN / 2;
+    }
+
+    /// Recompute (or reuse, per cadence) the session display order for the
+    /// latest payload, and return it applied to that payload.
+    fn ordered_top(&mut self, top: &serde_json::Value) -> serde_json::Value {
+        let sessions = top["sessions"].as_array().cloned().unwrap_or_default();
+        let now = self.now_ms();
+        let (order, last_reorder_ms) = compute_session_order(
+            &sessions,
+            &self.session_order,
+            self.sort_mode,
+            now,
+            self.last_reorder_ms,
+        );
+        self.session_order = order;
+        self.last_reorder_ms = last_reorder_ms;
+        reorder_top(top, &self.session_order)
     }
 
     /// Sessions default expanded; agents default collapsed. Apply the
@@ -419,7 +638,8 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
             Err(e) => Some(format!("{e:#}")),
         };
-        let rows = flatten(&last, &ui.expanded);
+        let display_top = ui.ordered_top(&last);
+        let rows = flatten(&display_top, &ui.expanded);
         // Clamp selection to an existing row; default to the first row.
         if ui
             .selected_key
@@ -498,9 +718,10 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             )
             .header(header)
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" ai-obs — live tree "),
+                Block::default().borders(Borders::ALL).title(format!(
+                    " ai-obs — live tree \u{b7} sort: {} ",
+                    ui.sort_mode.label()
+                )),
             );
             f.render_widget(table, chunks[0]);
 
@@ -533,9 +754,10 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
             let status = match &err {
                 Some(e) => Line::styled(format!(" {e} "), Style::default().fg(Color::Red)),
-                None => Line::from(
-                    " \u{2191}/\u{2193} move \u{b7} enter/space toggle \u{b7} q to quit ",
-                ),
+                None => Line::from(format!(
+                    " \u{2191}/\u{2193} move \u{b7} enter/space toggle \u{b7} s sort ({}) \u{b7} q to quit ",
+                    ui.sort_mode.label()
+                )),
             };
             f.render_widget(Paragraph::new(status), chunks[3]);
         })?;
@@ -544,6 +766,7 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             if let Event::Key(k) = event::read()? {
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('s') => ui.cycle_sort(),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if let Some(idx) = ui
                             .selected_key
@@ -733,5 +956,173 @@ mod tests {
         assert!((sum.cores - 1.45).abs() < 1e-9);
         assert_eq!(sum.tok_in, 12000);
         assert_eq!(sum.tok_out, 3000);
+    }
+
+    // ---------------- state label formatting ----------------
+
+    #[test]
+    fn fmt_state_running_has_no_idle_age() {
+        assert_eq!(fmt_state(true, 999_000, 0), "running");
+    }
+
+    #[test]
+    fn fmt_state_idle_shows_minutes() {
+        assert_eq!(fmt_state(false, 0, 0), "idle 0m");
+        assert_eq!(fmt_state(false, 5 * 60_000, 0), "idle 5m");
+        assert_eq!(fmt_state(false, 90 * 1000, 0), "idle 1m");
+    }
+
+    #[test]
+    fn fmt_state_omits_span_count_when_zero_but_shows_it_otherwise() {
+        // The bug this replaces: "0 spans" read as a meaningless status.
+        assert_eq!(fmt_state(true, 0, 0), "running");
+        assert_eq!(fmt_state(false, 120_000, 0), "idle 2m");
+        assert_eq!(fmt_state(true, 0, 1), "running \u{b7} 1 span");
+        assert_eq!(fmt_state(false, 120_000, 3), "idle 2m \u{b7} 3 spans");
+    }
+
+    #[test]
+    fn agent_title_and_fallback_naming() {
+        let data = serde_json::json!({
+            "sessions": [{
+                "session_id": "s1", "project": "p", "cost_usd": 0.0, "unpriced": 0,
+                "tokens_in": 0, "tokens_out": 0,
+                "agents": [
+                    {
+                        "agent_id": "abc123ef00", "agent_type": "Explore",
+                        "title": "Research subagent hook payloads",
+                        "cost_usd": 0.0, "tokens_out": 0,
+                        "open_spans": [], "recent_spans": []
+                    },
+                    {
+                        "agent_id": "def456", "agent_type": null,
+                        "title": "Just a title",
+                        "cost_usd": 0.0, "tokens_out": 0,
+                        "open_spans": [], "recent_spans": []
+                    },
+                    {
+                        "agent_id": "ghi789", "agent_type": "general-purpose",
+                        "title": null,
+                        "cost_usd": 0.0, "tokens_out": 0,
+                        "open_spans": [], "recent_spans": []
+                    },
+                    {
+                        "agent_id": "jkl0123456789", "agent_type": null,
+                        "title": null,
+                        "cost_usd": 0.0, "tokens_out": 0,
+                        "open_spans": [], "recent_spans": []
+                    }
+                ]
+            }],
+            "findings": []
+        });
+        let mut expanded = HashSet::new();
+        expanded.insert("sess:s1".to_string());
+        let rows = flatten(&data, &expanded);
+        // rows[0] is the session; agents follow.
+        assert!(rows[1]
+            .label
+            .contains("Explore: Research subagent hook payloads"));
+        assert!(rows[2].label.contains("Just a title"));
+        assert!(rows[3].label.contains("general-purpose (subagent)"));
+        // Never blank: falls back to a short id when both are unknown.
+        assert!(rows[4].label.contains("agent jkl01234"));
+    }
+
+    // ---------------- sort mode / reorder cadence ----------------
+
+    fn sess_at(id: &str, cpu: f64) -> serde_json::Value {
+        serde_json::json!({"session_id": id, "cpu_pct": cpu, "footprint_mb": 0, "cost_usd": 0.0})
+    }
+
+    #[test]
+    fn recent_mode_never_reorders() {
+        let sessions = vec![sess_at("a", 10.0), sess_at("b", 90.0)];
+        let (order, _) = compute_session_order(&sessions, &[], SortMode::Recent, 100_000, 0);
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn cpu_mode_sorts_descending_on_first_compute() {
+        let sessions = vec![sess_at("a", 10.0), sess_at("b", 90.0)];
+        let (order, last) = compute_session_order(&sessions, &[], SortMode::Cpu, 0, 0);
+        assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(last, 0);
+    }
+
+    #[test]
+    fn volatile_sort_freezes_order_within_the_cadence_window() {
+        let sessions = vec![sess_at("a", 10.0), sess_at("b", 90.0)];
+        let (order, last) = compute_session_order(&sessions, &[], SortMode::Cpu, 0, 0);
+        assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+
+        // "a" overtakes "b" on cpu, but only 2s have passed (< 5s freeze) ->
+        // order must NOT change yet.
+        let sessions2 = vec![sess_at("a", 500.0), sess_at("b", 1.0)];
+        let (order2, last2) = compute_session_order(&sessions2, &order, SortMode::Cpu, 2_000, last);
+        assert_eq!(order2, vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(last2, last); // unchanged: no recompute happened
+
+        // Past the freeze window -> resort reflects the new values.
+        let (order3, last3) =
+            compute_session_order(&sessions2, &order2, SortMode::Cpu, 6_000, last2);
+        assert_eq!(order3, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(last3, 6_000);
+    }
+
+    #[test]
+    fn volatile_sort_appends_newcomers_without_disturbing_frozen_order() {
+        let sessions = vec![sess_at("a", 10.0), sess_at("b", 90.0)];
+        let (order, last) = compute_session_order(&sessions, &[], SortMode::Cpu, 0, 0);
+        assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+
+        // "c" appears mid-freeze-window; existing order must be preserved,
+        // "c" appended (even though it'd sort first by cpu).
+        let sessions2 = vec![sess_at("a", 10.0), sess_at("b", 90.0), sess_at("c", 999.0)];
+        let (order2, _) = compute_session_order(&sessions2, &order, SortMode::Cpu, 1_000, last);
+        assert_eq!(
+            order2,
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn reorder_top_reorders_sessions_array_by_id() {
+        let data = serde_json::json!({
+            "sessions": [sess_at("a", 1.0), sess_at("b", 2.0)],
+            "findings": []
+        });
+        let out = reorder_top(&data, &["b".to_string(), "a".to_string()]);
+        let ids: Vec<&str> = out["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    /// The core anti-jump guarantee: selecting an item by its stable key,
+    /// then reordering the underlying sessions (as a volatile sort would),
+    /// must keep that same item selected — never silently fall back to
+    /// "first row" just because its visual position moved.
+    #[test]
+    fn selection_by_key_survives_session_reordering() {
+        let data = sample();
+        let mut expanded = HashSet::new();
+        expanded.insert("sess:s1".to_string());
+        let rows_before = flatten(&data, &expanded);
+        let selected_key = rows_before[2].key.clone(); // the subagent row
+
+        // Simulate a reorder: rebuild the payload with sessions in a
+        // different (but here, single-session) order — the interesting
+        // case is verified at the compute_session_order level above; this
+        // confirms flatten()+key lookup still finds the same logical row
+        // after going through reorder_top.
+        let reordered = reorder_top(&data, &["s1".to_string()]);
+        let rows_after = flatten(&reordered, &expanded);
+        let found = rows_after.iter().find(|r| r.key == selected_key);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().key, rows_before[2].key);
     }
 }
