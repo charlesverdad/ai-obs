@@ -30,7 +30,7 @@ type RecentSpansCache = Arc<Mutex<Option<(Instant, Arc<HashMap<String, Vec<Recen
 /// Timestamped, refcounted snapshot of `agent_span_times()`.
 type AgentSpanTimesCache = Arc<Mutex<Option<(Instant, Arc<AgentSpanTimes>)>>>;
 
-/// (kind, severity, session_id, span_id, pid, message)
+/// (kind, severity, session_id, span_id, pid, message, proc_start_ms)
 type Finding = (
     String,
     String,
@@ -38,7 +38,29 @@ type Finding = (
     Option<i64>,
     Option<i32>,
     String,
+    Option<i64>,
 );
+
+/// How long a process identity's already-reported orphan finding suppresses
+/// a repeat. Generous on purpose: an orphan that's still alive is still the
+/// same finding, not a new one — this just bounds how far back the
+/// dedup-check query has to look. The in-memory `reported` flags on
+/// `OrphanWatch`/`LooseProc` are the fast path that avoids even reaching
+/// this check in the common case; this is the backstop for the cases where
+/// a process gets independently re-tracked (see `Store::recent_finding_exists`).
+const ORPHAN_DEDUP_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// How an orphan finding's message names the command it's attributed to.
+/// A resolved digest is quoted directly; an unresolved/absent one (span
+/// attribution never landed, or degraded to session-level because >1 span
+/// was open) reads as `session-level` rather than a bare `?`, which used to
+/// read as a mysterious unknown rather than "this pid belongs to the
+/// session, just not to one specific tool call".
+fn attribution_label(cmd_digest: Option<&str>) -> &str {
+    cmd_digest
+        .filter(|s| !s.is_empty())
+        .unwrap_or("session-level")
+}
 
 pub fn port() -> u16 {
     std::env::var("AI_OBS_PORT")
@@ -119,7 +141,14 @@ pub async fn run(db_path: &std::path::Path) -> anyhow::Result<()> {
     // Opened after Store::open above so the schema (incl. the dashboard's
     // idx_llm_ts / idx_span_started indexes) already exists.
     let dashboard_store = Arc::new(Store::open_readonly(db_path)?);
-    let corr = Arc::new(Mutex::new(Correlator::default()));
+    let allowlist =
+        crate::config::load_merged_orphan_allowlist(crate::correlator::ORPHAN_ALLOWLIST);
+    tracing::info!(
+        "orphan allowlist ({} names): {:?}",
+        allowlist.len(),
+        allowlist
+    );
+    let corr = Arc::new(Mutex::new(Correlator::new(allowlist)));
     let state = AppState {
         store: store.clone(),
         corr: corr.clone(),
@@ -256,6 +285,11 @@ async fn detector_loop(state: AppState) {
             let ncores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8) as f64;
+            // Cloned once per tick (short list, 10s cadence) so it can be
+            // read alongside `corr.sessions.values_mut()` below without a
+            // field-borrow conflict.
+            let allowlist = corr.allowlist.clone();
+            let dedup_since = now - ORPHAN_DEDUP_WINDOW_MS;
             let mut total_cpu_pct = 0.0;
             for sess in corr.sessions.values_mut() {
                 total_cpu_pct += sess.cpu_pct;
@@ -265,7 +299,10 @@ async fn detector_loop(state: AppState) {
                     .and_then(|r| r.rsplit('/').next())
                     .unwrap_or("?")
                     .to_string();
-                // Orphans: alive N seconds after their span closed.
+                // Orphans: alive N seconds after their span closed. Severity
+                // is graded from measured burn (see grade_orphan_severity),
+                // not a fixed 'crit' — most orphans (e.g. an intentional
+                // `caffeinate`) are near-idle and should read as low-signal.
                 for w in sess.orphan_watch.iter_mut() {
                     if w.reported {
                         continue;
@@ -276,13 +313,25 @@ async fn detector_loop(state: AppState) {
                     }
                     if now - w.closed_at > 60_000 {
                         w.reported = true;
-                        let fp = crate::mac::usage(w.pid)
-                            .map(|u| u.phys_footprint / 1_000_000)
-                            .unwrap_or(0);
-                        let cmd = w.cmd_digest.as_deref().unwrap_or("?");
+                        let usage = crate::mac::usage(w.pid);
+                        let fp = usage.map(|u| u.phys_footprint / 1_000_000).unwrap_or(0);
+                        let cpu_pct = match (usage, w.start_sec) {
+                            (Some(u), Some(s)) => crate::mac::cpu_pct_since_start(&u, s, now),
+                            _ => 0.0,
+                        };
+                        let sev = crate::correlator::grade_orphan_severity(cpu_pct, fp);
+                        let proc_start_ms = w.start_sec.map(|s| s as i64 * 1000);
+                        let already = state
+                            .store
+                            .recent_finding_exists("orphan", w.pid, proc_start_ms, dedup_since)
+                            .unwrap_or(false);
+                        if already {
+                            continue;
+                        }
+                        let cmd = attribution_label(w.cmd_digest.as_deref());
                         findings.push((
                             "orphan".into(),
-                            "crit".into(),
+                            sev.into(),
                             Some(sess.id.clone()),
                             Some(w.span_id),
                             Some(w.pid),
@@ -290,6 +339,7 @@ async fn detector_loop(state: AppState) {
                                 "{} (pid {}) from `{}` in {} outlived its tool call by 60s+, {} MB",
                                 w.comm, w.pid, cmd, project, fp
                             ),
+                            proc_start_ms,
                         ));
                     }
                 }
@@ -301,11 +351,19 @@ async fn detector_loop(state: AppState) {
                 // missed them, or they simply appeared with no span open) but
                 // have since reparented away from the claude tree and stuck
                 // around. Attribution is weaker here than the span-based
-                // orphan_watch above, so these report at 'warn' not 'crit'.
-                for lf in sess.sweep_loose_orphans(&procs, now) {
+                // orphan_watch above; severity is graded the same way.
+                for lf in sess.sweep_loose_orphans(&procs, now, &allowlist) {
+                    let proc_start_ms = lf.start_sec.map(|s| s as i64 * 1000);
+                    let already = state
+                        .store
+                        .recent_finding_exists("orphan", lf.pid, proc_start_ms, dedup_since)
+                        .unwrap_or(false);
+                    if already {
+                        continue;
+                    }
                     findings.push((
                         "orphan".into(),
-                        "warn".into(),
+                        lf.severity.into(),
                         Some(sess.id.clone()),
                         None,
                         Some(lf.pid),
@@ -317,6 +375,7 @@ async fn detector_loop(state: AppState) {
                             project,
                             lf.footprint_mb
                         ),
+                        proc_start_ms,
                     ));
                 }
 
@@ -334,6 +393,7 @@ async fn detector_loop(state: AppState) {
                             project,
                             sess.footprint as f64 / (1u64 << 30) as f64
                         ),
+                        None,
                     ));
                 }
             }
@@ -348,14 +408,21 @@ async fn detector_loop(state: AppState) {
                         "tracked sessions requesting {:.0}% CPU on {} cores",
                         total_cpu_pct, ncores
                     ),
+                    None,
                 ));
             }
         }
-        for (kind, sev, sid, span, pid, msg) in findings {
+        for (kind, sev, sid, span, pid, msg, proc_start_ms) in findings {
             tracing::warn!("[{kind}] {msg}");
-            let _ = state
-                .store
-                .insert_finding(&kind, &sev, sid.as_deref(), span, pid, &msg);
+            let _ = state.store.insert_finding(
+                &kind,
+                &sev,
+                sid.as_deref(),
+                span,
+                pid,
+                &msg,
+                proc_start_ms,
+            );
         }
     }
 }
@@ -941,5 +1008,18 @@ mod tests {
     fn host_guard_is_scoped_to_the_configured_port() {
         assert!(host_is_allowed(Some("127.0.0.1:18771"), 18771));
         assert!(!host_is_allowed(Some("127.0.0.1:18771"), 8770));
+    }
+
+    #[test]
+    fn attribution_label_uses_resolved_digest() {
+        assert_eq!(attribution_label(Some("cargo test")), "cargo test");
+    }
+
+    #[test]
+    fn attribution_label_falls_back_for_unresolved_or_absent() {
+        assert_eq!(attribution_label(None), "session-level");
+        assert_eq!(attribution_label(Some("")), "session-level");
+        // Never a bare "?" — the whole point of this fallback.
+        assert_ne!(attribution_label(None), "?");
     }
 }

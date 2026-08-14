@@ -235,6 +235,19 @@ pub fn usage(pid: i32) -> Option<ProcUsage> {
     })
 }
 
+/// Average CPU utilization since process start: cumulative user+sys ns
+/// (from `usage`) divided by wall-clock age. A crude but simple proxy for
+/// "sustained" load — a short burst averages out over a long-lived orphan,
+/// unlike an instantaneous sample. Deliberately synchronous (no
+/// double-sampling across a sleep): the orphan detector holds the
+/// correlator's `std::sync::Mutex` while grading severity, and that mutex
+/// guard can't be held across an `.await` point.
+pub fn cpu_pct_since_start(usage: &ProcUsage, start_sec: u64, now_ms: i64) -> f64 {
+    let age_ms = (now_ms - (start_sec as i64) * 1000).max(1);
+    let ns = usage.cpu_user_ns + usage.cpu_sys_ns;
+    (ns as f64 / (age_ms as f64 * 1_000_000.0)) * 100.0
+}
+
 /// Self-check used by `ai-obs doctor` and the test suite: our own CPU time via
 /// proc_pid_rusage (mach ticks, converted) must agree with getrusage(RUSAGE_SELF)
 /// (timevals, authoritative) within tolerance. Catches timebase mistakes — the
@@ -296,6 +309,36 @@ mod tests {
         // unprivileged-read guarantee the whole design rests on.
         let parent = unsafe { libc::getppid() };
         assert!(usage(parent).is_some(), "cannot read same-uid non-child");
+    }
+
+    #[test]
+    fn cpu_pct_since_start_basic() {
+        // 1 second of user CPU over a 10-second wall age = 10%.
+        let u = ProcUsage {
+            cpu_user_ns: 1_000_000_000,
+            ..Default::default()
+        };
+        let now_ms = 20_000_000i64; // arbitrary "now" 20000s since epoch
+        let start_sec = (20_000_000 / 1000) - 10; // started 10s before now
+        let pct = cpu_pct_since_start(&u, start_sec as u64, now_ms);
+        assert!((pct - 10.0).abs() < 0.5, "got {pct}");
+    }
+
+    #[test]
+    fn cpu_pct_since_start_zero_cpu() {
+        let u = ProcUsage::default();
+        assert_eq!(cpu_pct_since_start(&u, 0, 1_000_000), 0.0);
+    }
+
+    #[test]
+    fn cpu_pct_since_start_never_divides_by_zero() {
+        // start_sec == now (age clamped to 1ms minimum) must not panic/NaN/inf.
+        let u = ProcUsage {
+            cpu_user_ns: 5_000_000,
+            ..Default::default()
+        };
+        let pct = cpu_pct_since_start(&u, 100, 100_000);
+        assert!(pct.is_finite());
     }
 
     #[test]

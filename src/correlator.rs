@@ -14,6 +14,10 @@ use std::sync::Arc;
 const SHELL_COMMS: &[&str] = &["zsh", "bash", "sh", "-zsh", "-bash", "-sh"];
 
 /// Long-lived helpers that are expected to outlive tool calls; not orphans.
+/// Merged at daemon startup with any user-supplied `orphan_allowlist` from
+/// `~/.config/ai-obs/config.toml` (see `config.rs`) into `Correlator::allowlist`
+/// — call sites in this file should use that merged list, not this constant,
+/// except when constructing it.
 pub const ORPHAN_ALLOWLIST: &[&str] = &[
     "rust-analyzer",
     "gopls",
@@ -25,6 +29,7 @@ pub const ORPHAN_ALLOWLIST: &[&str] = &[
     "clangd",
     "watchman",
     "biomesyncd",
+    "caffeinate",
 ];
 
 #[derive(Clone, Debug)]
@@ -48,11 +53,42 @@ pub struct LooseProc {
 }
 
 /// One orphan finding raised from the loose-proc sweep.
+#[derive(Debug)]
 pub struct LooseFinding {
     pub pid: i32,
     pub comm: String,
     pub age_ms: i64,
     pub footprint_mb: u64,
+    /// Process start time (unix seconds), when known — part of the process
+    /// identity used to dedup findings across pid reuse (see `store.rs`'s
+    /// `finding.proc_start_ms` column).
+    pub start_sec: Option<u64>,
+    /// Severity graded from measured burn at detection time — see
+    /// `grade_orphan_severity`.
+    pub severity: &'static str,
+}
+
+/// Cost-graded severity thresholds for orphan findings (design: observe
+/// only, no auto-kill — severity should reflect actual measured burn, not
+/// just "this process outlived its span"). Boundaries:
+///   info = <5% CPU  AND <100MB RSS
+///   warn = 5-50% CPU OR 100MB-1GB RSS
+///   crit = >50% CPU (sustained, see `mac::cpu_pct_since_start`) OR >1GB RSS
+pub const ORPHAN_INFO_CPU_PCT_MAX: f64 = 5.0;
+pub const ORPHAN_INFO_FOOTPRINT_MB_MAX: u64 = 100;
+pub const ORPHAN_CRIT_CPU_PCT_MIN: f64 = 50.0;
+pub const ORPHAN_CRIT_FOOTPRINT_MB_MIN: u64 = 1024;
+
+/// Grade one orphan's severity from its measured CPU% (see
+/// `mac::cpu_pct_since_start`) and RSS footprint at detection time.
+pub fn grade_orphan_severity(cpu_pct: f64, footprint_mb: u64) -> &'static str {
+    if cpu_pct > ORPHAN_CRIT_CPU_PCT_MIN || footprint_mb > ORPHAN_CRIT_FOOTPRINT_MB_MIN {
+        "crit"
+    } else if cpu_pct >= ORPHAN_INFO_CPU_PCT_MAX || footprint_mb >= ORPHAN_INFO_FOOTPRINT_MB_MAX {
+        "warn"
+    } else {
+        "info"
+    }
 }
 
 pub struct Span {
@@ -106,6 +142,9 @@ pub struct OrphanWatch {
     pub cmd_digest: Option<String>,
     pub closed_at: i64,
     pub reported: bool,
+    /// Process start time (unix seconds), when known — part of the process
+    /// identity used to dedup findings across pid reuse.
+    pub start_sec: Option<u64>,
 }
 
 impl Session {
@@ -114,7 +153,8 @@ impl Session {
     /// session's claude process (i.e. reparented away — truly detached,
     /// vs. merely never having been inside an open span). Attribution here
     /// is weaker than the span-based orphan watch (we never saw this proc
-    /// open a span), so callers should raise these at a lower severity.
+    /// open a span); severity is graded from measured CPU/footprint (see
+    /// `grade_orphan_severity`), same as the span-based watch.
     ///
     /// Marks matched entries `reported` (so they fire once) and prunes dead
     /// pids so `loose_procs` doesn't grow unboundedly over a long session.
@@ -122,6 +162,7 @@ impl Session {
         &mut self,
         procs: &HashMap<i32, ProcInfo>,
         now: i64,
+        allowlist: &[String],
     ) -> Vec<LooseFinding> {
         self.loose_procs.retain(|pid, _| procs.contains_key(pid));
         let desc = self
@@ -137,9 +178,7 @@ impl Session {
             if age_ms < 120_000 {
                 continue;
             }
-            let is_allowed = ORPHAN_ALLOWLIST
-                .iter()
-                .any(|a| lp.agg.info.comm.starts_with(a));
+            let is_allowed = allowlist.iter().any(|a| lp.agg.info.comm.starts_with(a));
             if is_allowed {
                 continue;
             }
@@ -147,14 +186,18 @@ impl Session {
                 continue; // still attached to the claude tree — not detached
             }
             lp.reported = true;
-            let footprint_mb = mac::usage(*pid)
-                .map(|u| u.phys_footprint / 1_000_000)
-                .unwrap_or(0);
+            let u = mac::usage(*pid);
+            let footprint_mb = u.map(|u| u.phys_footprint / 1_000_000).unwrap_or(0);
+            let cpu_pct = u
+                .map(|u| mac::cpu_pct_since_start(&u, lp.agg.info.start_sec, now))
+                .unwrap_or(0.0);
             findings.push(LooseFinding {
                 pid: *pid,
                 comm: lp.agg.info.comm.clone(),
                 age_ms,
                 footprint_mb,
+                start_sec: Some(lp.agg.info.start_sec),
+                severity: grade_orphan_severity(cpu_pct, footprint_mb),
             });
         }
         findings
@@ -164,6 +207,12 @@ impl Session {
 #[derive(Default)]
 pub struct Correlator {
     pub sessions: HashMap<String, Session>,
+    /// Process names never flagged as orphans — built-in defaults merged
+    /// with the user's `orphan_allowlist` config (see `config.rs`),
+    /// resolved once at daemon startup. `Default::default()` (used by most
+    /// tests) yields an empty list, matching pre-config behavior for tests
+    /// that don't care about allowlisting.
+    pub allowlist: Vec<String>,
 }
 
 pub struct OpenSpanArgs<'a> {
@@ -505,6 +554,13 @@ fn extract_two_words(segment: &str) -> String {
 }
 
 impl Correlator {
+    pub fn new(allowlist: Vec<String>) -> Self {
+        Correlator {
+            sessions: HashMap::new(),
+            allowlist,
+        }
+    }
+
     pub fn ensure_session(
         &mut self,
         session_id: &str,
@@ -692,9 +748,7 @@ impl Correlator {
             peak = peak.max(agg.peak_footprint);
             disk_r += u.disk_read;
             disk_w += u.disk_write;
-            let is_allowed = ORPHAN_ALLOWLIST
-                .iter()
-                .any(|a| agg.info.comm.starts_with(a));
+            let is_allowed = self.allowlist.iter().any(|a| agg.info.comm.starts_with(a));
             if alive && !is_allowed {
                 orphaned += 1;
             }
@@ -739,9 +793,7 @@ impl Correlator {
             Ok(span_id) => {
                 for (pid, agg) in span.procs.iter() {
                     if procs.contains_key(pid)
-                        && !ORPHAN_ALLOWLIST
-                            .iter()
-                            .any(|a| agg.info.comm.starts_with(a))
+                        && !self.allowlist.iter().any(|a| agg.info.comm.starts_with(a))
                     {
                         sess.orphan_watch.push(OrphanWatch {
                             span_id,
@@ -750,6 +802,7 @@ impl Correlator {
                             cmd_digest: span.cmd_digest.clone(),
                             closed_at: ended_at,
                             reported: false,
+                            start_sec: procs.get(pid).map(|p| p.start_sec),
                         });
                     }
                 }
@@ -1349,5 +1402,147 @@ mod tests {
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let root = project_root_of(src);
         assert!(std::path::Path::new(&root).join(".git").exists());
+    }
+
+    // ---------------- orphan severity grading ----------------
+
+    #[test]
+    fn severity_info_low_cpu_low_footprint() {
+        assert_eq!(grade_orphan_severity(0.0, 0), "info");
+        assert_eq!(grade_orphan_severity(4.9, 99), "info");
+    }
+
+    #[test]
+    fn severity_warn_boundaries() {
+        // Exactly at the info->warn boundary on either axis is warn, per
+        // the documented "5-50% CPU or 100MB-1GB" range (inclusive lower
+        // bound).
+        assert_eq!(grade_orphan_severity(5.0, 0), "warn");
+        assert_eq!(grade_orphan_severity(0.0, 100), "warn");
+        assert_eq!(grade_orphan_severity(20.0, 500), "warn");
+        assert_eq!(grade_orphan_severity(50.0, 0), "warn"); // exactly 50% is not yet crit
+        assert_eq!(grade_orphan_severity(0.0, 1024), "warn"); // exactly 1GB is not yet crit
+    }
+
+    #[test]
+    fn severity_crit_over_threshold() {
+        assert_eq!(grade_orphan_severity(50.1, 0), "crit");
+        assert_eq!(grade_orphan_severity(0.0, 1025), "crit");
+        assert_eq!(grade_orphan_severity(90.0, 2000), "crit");
+    }
+
+    #[test]
+    fn caffeinate_is_in_builtin_allowlist() {
+        assert!(ORPHAN_ALLOWLIST.contains(&"caffeinate"));
+    }
+
+    // ---------------- loose-orphan sweep: allowlist + severity ----------------
+
+    fn base_session() -> Session {
+        Session {
+            id: "s1".into(),
+            project_root: None,
+            project_id: None,
+            claude_pid: Some(1),
+            git_branch: None,
+            started_at: 0,
+            sticky: HashSet::new(),
+            open_spans: Vec::new(),
+            loose_procs: HashMap::new(),
+            orphan_watch: Vec::new(),
+            prev_cpu_ns: 0,
+            prev_tick_ms: 0,
+            cpu_pct: 0.0,
+            footprint: 0,
+            proc_count: 0,
+            current_tool: None,
+        }
+    }
+
+    #[test]
+    fn sweep_loose_orphans_respects_configured_allowlist() {
+        let mut sess = base_session();
+        // pid 42 ("sleep") started long enough ago to be eligible, and is
+        // detached (procs snapshot has no claude(1) at all, so it can never
+        // be a "still attached" descendant).
+        sess.loose_procs.insert(
+            42,
+            LooseProc {
+                agg: ProcAgg {
+                    info: proc(42, 999, "sleep", 0),
+                    depth: -1,
+                    first_seen: 0,
+                    last_seen: 0,
+                    last_usage: mac::ProcUsage::default(),
+                    peak_footprint: 0,
+                    exited: false,
+                },
+                reported: false,
+            },
+        );
+        let procs: HashMap<i32, ProcInfo> = [proc(42, 999, "sleep", 0)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        // Not allowlisted: fires.
+        let findings = sess.sweep_loose_orphans(&procs, 200_000, &[]);
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        assert_eq!(findings[0].severity, "info"); // sleep burns ~nothing
+
+        // Re-insert (reset `reported`) and sweep again with "sleep" allowlisted.
+        sess.loose_procs.insert(
+            42,
+            LooseProc {
+                agg: ProcAgg {
+                    info: proc(42, 999, "sleep", 0),
+                    depth: -1,
+                    first_seen: 0,
+                    last_seen: 0,
+                    last_usage: mac::ProcUsage::default(),
+                    peak_footprint: 0,
+                    exited: false,
+                },
+                reported: false,
+            },
+        );
+        let allowlist = vec!["sleep".to_string()];
+        let findings2 = sess.sweep_loose_orphans(&procs, 200_000, &allowlist);
+        assert!(
+            findings2.is_empty(),
+            "allowlisted name should not fire: {findings2:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_loose_orphans_reports_once_per_identity() {
+        let mut sess = base_session();
+        sess.loose_procs.insert(
+            42,
+            LooseProc {
+                agg: ProcAgg {
+                    info: proc(42, 999, "sleep", 0),
+                    depth: -1,
+                    first_seen: 0,
+                    last_seen: 0,
+                    last_usage: mac::ProcUsage::default(),
+                    peak_footprint: 0,
+                    exited: false,
+                },
+                reported: false,
+            },
+        );
+        let procs: HashMap<i32, ProcInfo> = [proc(42, 999, "sleep", 0)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        let first = sess.sweep_loose_orphans(&procs, 200_000, &[]);
+        assert_eq!(first.len(), 1);
+        // A second sweep pass (same struct, same 'reported' flag already
+        // set) must not re-emit for the same still-alive process.
+        let second = sess.sweep_loose_orphans(&procs, 260_000, &[]);
+        assert!(
+            second.is_empty(),
+            "detector pass re-emitted for an already-reported process: {second:?}"
+        );
     }
 }

@@ -510,10 +510,10 @@ fn loop_ui(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 .iter()
                 .map(|x| {
                     let sev = x["severity"].as_str().unwrap_or("");
-                    let color = if sev == "crit" {
-                        Color::Red
-                    } else {
-                        Color::Yellow
+                    let color = match sev {
+                        "crit" => Color::Red,
+                        "info" => Color::DarkGray,
+                        _ => Color::Yellow, // "warn" and any unrecognized severity
                     };
                     Line::styled(
                         format!(
