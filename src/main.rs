@@ -1,4 +1,5 @@
 mod client;
+mod config;
 mod correlator;
 mod daemon;
 mod doctor;
@@ -91,6 +92,14 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Install { dry_run, launchd } => {
             println!("{}", install::install(daemon::port(), dry_run)?);
+            match config::ensure_default_config(dry_run) {
+                Ok(Some(path)) if dry_run => {
+                    println!("[dry-run] would write default config to {}", path.display())
+                }
+                Ok(Some(path)) => println!("wrote default config to {}", path.display()),
+                Ok(None) => {} // already exists — left untouched
+                Err(e) => println!("warning: could not write default config: {e:#}"),
+            }
             if launchd && !dry_run {
                 println!("{}", install::install_launchd()?);
             }

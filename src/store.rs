@@ -197,8 +197,16 @@ CREATE TABLE IF NOT EXISTS finding (
   span_id INTEGER,
   pid INTEGER,
   message TEXT NOT NULL,
-  resolved_at INTEGER
+  resolved_at INTEGER,
+  -- Process start time (unix ms), when known. Part of the process identity
+  -- (pid + start time) used to dedup orphan findings across pid reuse — see
+  -- Store::recent_finding_exists. NULL for finding kinds that aren't
+  -- per-process (contention, memory) or where start time wasn't available.
+  proc_start_ms INTEGER
 );
+-- Backs the dedup check in Store::recent_finding_exists (one query per
+-- would-be orphan finding, in the 10s detector loop).
+CREATE INDEX IF NOT EXISTS idx_finding_kind_pid ON finding(kind, pid, ts);
 -- Historical dashboard aggregates (src/history.rs) range-filter on these
 -- columns; CREATE INDEX IF NOT EXISTS is naturally idempotent so this needs
 -- no pragma-guarded migration like the ALTER TABLE below.
@@ -270,6 +278,21 @@ fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE tool_span RENAME COLUMN leaked_count TO orphaned_count",
             [],
         )?;
+    }
+    let has_proc_start_ms = {
+        let mut stmt = conn.prepare("PRAGMA table_info(finding)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for n in names {
+            if n? == "proc_start_ms" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_proc_start_ms {
+        conn.execute("ALTER TABLE finding ADD COLUMN proc_start_ms INTEGER", [])?;
     }
     Ok(())
 }
@@ -727,6 +750,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_finding(
         &self,
         kind: &str,
@@ -735,14 +759,53 @@ impl Store {
         span_id: Option<i64>,
         pid: Option<i32>,
         message: &str,
+        proc_start_ms: Option<i64>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO finding(ts, kind, severity, session_id, span_id, pid, message)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![now_ms(), kind, severity, session_id, span_id, pid, message],
+            "INSERT INTO finding(ts, kind, severity, session_id, span_id, pid, message, proc_start_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                now_ms(),
+                kind,
+                severity,
+                session_id,
+                span_id,
+                pid,
+                message,
+                proc_start_ms
+            ],
         )?;
         Ok(())
+    }
+
+    /// True if a finding of this `kind` for this exact process identity
+    /// (pid + `proc_start_ms`, when known — falls back to pid alone when
+    /// `proc_start_ms` is `None`) was already recorded within `since_ts`.
+    /// Backs orphan-finding dedup: the in-memory `reported` flags on
+    /// `OrphanWatch`/`LooseProc` already stop the *same* tracked struct from
+    /// refiring, but a process can independently re-enter tracking (e.g.
+    /// re-discovered as a loose proc after its span-based orphan_watch entry
+    /// already fired, or the daemon restarted) — this DB-backed check is the
+    /// single source of truth that catches those cases too.
+    pub fn recent_finding_exists(
+        &self,
+        kind: &str,
+        pid: i32,
+        proc_start_ms: Option<i64>,
+        since_ts: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM finding
+               WHERE kind = ?1 AND pid = ?2 AND ts > ?3
+                 AND (proc_start_ms IS ?4 OR ?4 IS NULL)
+             )",
+            params![kind, pid, since_ts, proc_start_ms],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Recent findings, newest first.
@@ -1160,6 +1223,137 @@ mod tests {
         // Idempotent: running again finds nothing left to sweep.
         let n2 = s.close_stale_agent_spans(day_ms).unwrap();
         assert_eq!(n2, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn proc_start_ms_column_is_added_and_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-obs-test-finding-migrate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            // Pre-migration `finding` table shape (no proc_start_ms).
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE finding (
+                   id INTEGER PRIMARY KEY,
+                   ts INTEGER NOT NULL,
+                   kind TEXT NOT NULL,
+                   severity TEXT NOT NULL,
+                   session_id TEXT,
+                   span_id INTEGER,
+                   pid INTEGER,
+                   message TEXT NOT NULL,
+                   resolved_at INTEGER
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO finding(ts, kind, severity, pid, message) \
+                 VALUES (1000, 'orphan', 'warn', 42, 'pre-migration row')",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        // Old row survives, new column is queryable (NULL for the old row).
+        let rows = s
+            .query_json(
+                "SELECT message, proc_start_ms FROM finding WHERE pid = 42",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["message"], "pre-migration row");
+        assert!(rows[0]["proc_start_ms"].is_null());
+        // recent_finding_exists must work against the migrated table too.
+        assert!(s.recent_finding_exists("orphan", 42, None, 0).unwrap());
+        drop(s);
+
+        // Reopening an already-migrated db is a harmless no-op.
+        let s2 = Store::open(&db).unwrap();
+        assert!(s2.recent_finding_exists("orphan", 42, None, 0).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_finding_dedup_by_pid_and_start_ms() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-obs-test-finding-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        let now = now_ms();
+
+        // Nothing recorded yet.
+        assert!(!s
+            .recent_finding_exists("orphan", 4242, Some(1_000), now - 60_000)
+            .unwrap());
+
+        s.insert_finding(
+            "orphan",
+            "info",
+            Some("s1"),
+            None,
+            Some(4242),
+            "caffeinate (pid 4242) ...",
+            Some(1_000),
+        )
+        .unwrap();
+
+        // Same identity (pid + start_ms): dedup hit.
+        assert!(s
+            .recent_finding_exists("orphan", 4242, Some(1_000), now - 60_000)
+            .unwrap());
+        // Same pid, different start time (pid was reused by a new process):
+        // not the same identity, no hit.
+        assert!(!s
+            .recent_finding_exists("orphan", 4242, Some(9_999), now - 60_000)
+            .unwrap());
+        // Outside the lookback window: no hit.
+        assert!(!s
+            .recent_finding_exists("orphan", 4242, Some(1_000), now + 1)
+            .unwrap());
+        // Different kind entirely: no hit.
+        assert!(!s
+            .recent_finding_exists("memory", 4242, Some(1_000), now - 60_000)
+            .unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_finding_dedup_falls_back_to_pid_when_start_ms_unknown() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-obs-test-finding-dedup-nostart-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let s = Store::open(&db).unwrap();
+        let now = now_ms();
+
+        s.insert_finding(
+            "orphan",
+            "warn",
+            Some("s1"),
+            None,
+            Some(555),
+            "detached, unattributed",
+            None, // start time unavailable
+        )
+        .unwrap();
+
+        // Querying without a start_ms (also unavailable this time) falls
+        // back to pid-only matching.
+        assert!(s
+            .recent_finding_exists("orphan", 555, None, now - 60_000)
+            .unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }

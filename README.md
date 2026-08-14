@@ -59,11 +59,48 @@ Environment variables:
 | `AI_OBS_PORT`          | `8770`               | Port the daemon listens on / hooks post to |
 | `AI_OBS_DB`            | platform data dir     | SQLite database path             |
 | `AI_OBS_PROJECTS_DIR`  | `~/.claude/projects`  | Where to find session transcripts |
+| `AI_OBS_CONFIG`        | `~/.config/ai-obs/config.toml` | User config file path    |
 
 `ai-obs install` merges hooks into `~/.claude/settings.json` without
 touching hooks you already have (it only ever observes; it never returns
 `updatedInput` or a permission decision), and backs up the previous file
-before writing.
+before writing. It also writes a commented-out default config file to
+`~/.config/ai-obs/config.toml` if one doesn't exist yet (never overwrites
+one that's already there).
+
+## Configuration
+
+`~/.config/ai-obs/config.toml`, read once at daemon startup. There's no
+`toml` dependency in this project, so this is a deliberately tiny
+hand-rolled format — one recognized key so far:
+
+```toml
+# process names (comm, prefix-matched) the orphan detector never flags,
+# merged with the built-in defaults (language servers, caffeinate, ...)
+orphan_allowlist = ["caffeinate", "my-long-running-tool"]
+```
+
+A missing config file just means built-in defaults only; a malformed one
+logs a warning at daemon startup and also falls back to built-in
+defaults — a bad config file can never stop the daemon from starting.
+
+### Orphan detector
+
+A process is an "orphan" when it's still alive after its tool call (or its
+session, for processes never attributed to a span) has ended and it isn't
+allowlisted. Findings are graded by measured burn at detection time, not
+just by the fact that they outlived their span:
+
+| Severity | Condition                                |
+|----------|-------------------------------------------|
+| `info`   | < 5% CPU **and** < 100 MB RSS              |
+| `warn`   | 5–50% CPU **or** 100 MB – 1 GB RSS         |
+| `crit`   | > 50% CPU (sustained) **or** > 1 GB RSS    |
+
+Each process identity (pid + start time) is reported at most once —
+detector passes don't re-emit a finding for a process that's still alive
+and already reported. Findings are observational only: ai-obs never kills
+or otherwise acts on an orphaned process.
 
 ## Privacy
 
