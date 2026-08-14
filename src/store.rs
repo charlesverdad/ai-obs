@@ -18,7 +18,26 @@ pub fn default_db_path() -> PathBuf {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Agent titles ([`Store::set_agent_title`]) that arrived before the
+    /// corresponding `agent_span` row existed — SubagentStart is HTTP-push
+    /// while the transcript tailer that discovers titles lags ~3s behind, so
+    /// either order is possible. Applied (and removed) the moment
+    /// `open_agent_span` inserts the matching row; see both methods' docs.
+    /// A plain in-memory map is enough: this only bridges a few seconds of
+    /// race and doesn't need to survive a daemon restart (the transcript
+    /// tailer will simply re-derive it from the same transcript line on
+    /// next scan, since it resumes from its own checkpoint — the title
+    /// association itself is never persisted anywhere but this map and the
+    /// `agent_span.title` column).
+    pending_titles: Mutex<HashMap<(String, String), String>>,
 }
+
+/// Cap on [`Store::pending_titles`] — titles whose `agent_span` row never
+/// showed up (e.g. a subagent whose SubagentStart hook was dropped). Rather
+/// than grow unboundedly over a long-running daemon, drop the whole map past
+/// this size; losing a handful of not-yet-matched titles is harmless (the
+/// UI falls back to agent_type / a short id), unlike leaking memory forever.
+const PENDING_TITLES_CAP: usize = 500;
 
 /// A closed tool span plus its per-process rows, written in one transaction.
 pub struct SpanRecord {
@@ -69,6 +88,11 @@ pub struct TokenTotals {
     pub cost_usd: f64,
     /// Count of rows with a NULL cost_usd (i.e. cost unknown/unpriced).
     pub unpriced: i64,
+    /// `MAX(ts)` across the grouped rows — last LLM-activity timestamp (unix
+    /// ms). Feeds the live tree's idle-age computation (top.rs / daemon.rs
+    /// `build_agents`). 0 when the group has no rows (never used as a real
+    /// timestamp; callers treat 0 as "no signal" and fall back elsewhere).
+    pub last_ts: i64,
 }
 
 pub struct LlmUsageRecord {
@@ -96,11 +120,14 @@ pub struct AgentSpanRow {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub end_reason: Option<String>,
+    /// Task/Agent tool_use `description` correlated in by the tailer (see
+    /// `Store::set_agent_title`), when known.
+    pub title: Option<String>,
 }
 
-/// `(session_id, agent_id) -> (started_at, ended_at)`, as returned by
+/// `(session_id, agent_id) -> (started_at, ended_at, title)`, as returned by
 /// [`Store::agent_span_times`].
-pub type AgentSpanTimes = HashMap<(String, String), (i64, Option<i64>)>;
+pub type AgentSpanTimes = HashMap<(String, String), (i64, Option<i64>, Option<String>)>;
 
 /// One closed span, as returned by [`Store::recent_spans_all_sessions`].
 pub struct RecentSpanRow {
@@ -108,6 +135,9 @@ pub struct RecentSpanRow {
     pub tool_name: String,
     pub cmd_digest: Option<String>,
     pub duration_ms: i64,
+    /// Absolute `ended_at` (unix ms) — last-activity signal for the live
+    /// tree's idle-age computation.
+    pub ended_at: i64,
     pub cpu_ns: u64,
     pub peak_footprint: u64,
     pub ok: Option<bool>,
@@ -222,6 +252,11 @@ CREATE INDEX IF NOT EXISTS idx_span_started ON tool_span(started_at);
 -- SessionEnd ('session_end') and the detector loop's stale sweep ('stale',
 -- Store::close_stale_agent_spans) for rows open far longer than any real
 -- subagent run.
+-- `title` is the Task/Agent tool_use `input.description` (a short task
+-- title), correlated in from the parent transcript by the tailer — see
+-- Store::set_agent_title. It may arrive before or after this row exists
+-- (SubagentStart is HTTP-push; transcript tailing lags ~3s behind); the
+-- guarded ALTER below adds it to pre-existing dbs.
 CREATE TABLE IF NOT EXISTS agent_span (
   id INTEGER PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES session(id),
@@ -230,6 +265,7 @@ CREATE TABLE IF NOT EXISTS agent_span (
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
   end_reason TEXT CHECK(end_reason IN ('stop','session_end','stale') OR end_reason IS NULL),
+  title TEXT,
   UNIQUE(session_id, agent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_span_session ON agent_span(session_id, started_at);
@@ -294,6 +330,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_proc_start_ms {
         conn.execute("ALTER TABLE finding ADD COLUMN proc_start_ms INTEGER", [])?;
     }
+    let has_title = {
+        let mut stmt = conn.prepare("PRAGMA table_info(agent_span)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for n in names {
+            if n? == "title" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_title {
+        conn.execute("ALTER TABLE agent_span ADD COLUMN title TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -309,6 +360,7 @@ impl Store {
         migrate(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
+            pending_titles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -316,6 +368,7 @@ impl Store {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Store {
             conn: Mutex::new(conn),
+            pending_titles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -491,7 +544,8 @@ impl Store {
                 COALESCE(SUM(cache_read),0),
                 COALESCE(SUM(cache_creation),0),
                 COALESCE(SUM(COALESCE(cost_usd,0)),0),
-                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
+                COALESCE(MAX(ts),0)
              FROM llm_usage
              GROUP BY session_id",
         )?;
@@ -506,6 +560,7 @@ impl Store {
                     cache_creation: r.get(4)?,
                     cost_usd: r.get(5)?,
                     unpriced: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    last_ts: r.get(7)?,
                 },
             ))
         })?;
@@ -529,7 +584,8 @@ impl Store {
                 COALESCE(SUM(cache_read),0),
                 COALESCE(SUM(cache_creation),0),
                 COALESCE(SUM(COALESCE(cost_usd,0)),0),
-                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
+                COALESCE(MAX(ts),0)
              FROM llm_usage
              GROUP BY session_id, agent_id",
         )?;
@@ -545,6 +601,7 @@ impl Store {
                     cache_creation: r.get(5)?,
                     cost_usd: r.get(6)?,
                     unpriced: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    last_ts: r.get(8)?,
                 },
             ))
         })?;
@@ -582,6 +639,7 @@ impl Store {
                     tool_name: r.get(2)?,
                     cmd_digest: r.get(3)?,
                     duration_ms: ended_at - started_at,
+                    ended_at,
                     ok: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
                     cpu_ns: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
                     peak_footprint: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u64,
@@ -611,12 +669,51 @@ impl Store {
         agent_type: Option<&str>,
         started_at: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO agent_span(session_id, agent_id, agent_type, started_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, agent_id, agent_type, started_at],
-        )?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_span(session_id, agent_id, agent_type, started_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, agent_id, agent_type, started_at],
+            )?;
+        }
+        // A title may have arrived (via set_agent_title) before this row
+        // existed — the transcript tailer runs on its own ~3s poll and can
+        // beat or lag SubagentStart either way. Apply it now if so.
+        let pending = {
+            let mut pending = self.pending_titles.lock().unwrap();
+            pending.remove(&(session_id.to_string(), agent_id.to_string()))
+        };
+        if let Some(title) = pending {
+            self.set_agent_title(session_id, agent_id, &title)?;
+        }
+        Ok(())
+    }
+
+    /// Record the task title for a subagent, correlated in by the tailer
+    /// from the parent transcript's Task/Agent tool_use + tool_result pair.
+    /// Handles both arrival orders relative to `open_agent_span`:
+    /// - row already exists -> UPDATE it directly.
+    /// - row doesn't exist yet -> stash in `pending_titles`, applied by
+    ///   `open_agent_span` the moment the row is created.
+    pub fn set_agent_title(&self, session_id: &str, agent_id: &str, title: &str) -> Result<()> {
+        let updated = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE agent_span SET title = ?3 WHERE session_id = ?1 AND agent_id = ?2",
+                params![session_id, agent_id, title],
+            )?
+        };
+        if updated == 0 {
+            let mut pending = self.pending_titles.lock().unwrap();
+            if pending.len() >= PENDING_TITLES_CAP {
+                pending.clear();
+            }
+            pending.insert(
+                (session_id.to_string(), agent_id.to_string()),
+                title.to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -687,7 +784,7 @@ impl Store {
     pub fn agent_spans_for_session(&self, session_id: &str) -> Result<Vec<AgentSpanRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT agent_id, agent_type, started_at, ended_at, end_reason
+            "SELECT agent_id, agent_type, started_at, ended_at, end_reason, title
              FROM agent_span WHERE session_id = ?1 ORDER BY started_at",
         )?;
         let rows = stmt
@@ -698,32 +795,34 @@ impl Store {
                     started_at: r.get(2)?,
                     ended_at: r.get(3)?,
                     end_reason: r.get(4)?,
+                    title: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// `(session_id, agent_id) -> (started_at, ended_at)` for every
+    /// `(session_id, agent_id) -> (started_at, ended_at, title)` for every
     /// agent_span row, across all sessions — feeds the live `/api/top` tree
-    /// (agent row duration) via a short-TTL cache, same pattern as
+    /// (agent row duration + title) via a short-TTL cache, same pattern as
     /// [`Store::recent_spans_all_sessions`].
     pub fn agent_span_times(&self) -> Result<AgentSpanTimes> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT session_id, agent_id, started_at, ended_at FROM agent_span")?;
+        let mut stmt = conn
+            .prepare("SELECT session_id, agent_id, started_at, ended_at, title FROM agent_span")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut out = HashMap::new();
         for row in rows {
-            let (sid, aid, started_at, ended_at) = row?;
-            out.insert((sid, aid), (started_at, ended_at));
+            let (sid, aid, started_at, ended_at, title) = row?;
+            out.insert((sid, aid), (started_at, ended_at, title));
         }
         Ok(out)
     }
@@ -1174,11 +1273,57 @@ mod tests {
         let times = s.agent_span_times().unwrap();
         assert_eq!(
             times[&("s1".to_string(), "agentA".to_string())],
-            (1000, Some(2000))
+            (1000, Some(2000), None)
         );
         assert_eq!(
             times[&("s1".to_string(), "agentB".to_string())],
-            (3000, None)
+            (3000, None, None)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_agent_title_updates_existing_row_directly() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-title-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        s.open_agent_span("s1", "agentA", Some("Explore"), 1000)
+            .unwrap();
+        s.set_agent_title("s1", "agentA", "Research subagent hook payloads")
+            .unwrap();
+        let times = s.agent_span_times().unwrap();
+        assert_eq!(
+            times[&("s1".to_string(), "agentA".to_string())]
+                .2
+                .as_deref(),
+            Some("Research subagent hook payloads")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_agent_title_before_span_exists_is_applied_on_open() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-test-title-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        s.upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        // Title arrives first (transcript tailer beat SubagentStart's HTTP
+        // push) — no agent_span row exists yet.
+        s.set_agent_title("s1", "agentB", "Implement Bash attribution")
+            .unwrap();
+        assert!(s.agent_span_times().unwrap().is_empty());
+
+        s.open_agent_span("s1", "agentB", Some("general-purpose"), 1000)
+            .unwrap();
+        let times = s.agent_span_times().unwrap();
+        assert_eq!(
+            times[&("s1".to_string(), "agentB".to_string())]
+                .2
+                .as_deref(),
+            Some("Implement Bash attribution")
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -711,12 +711,19 @@ fn agent_span_times(st: &AppState) -> Arc<AgentSpanTimes> {
 #[derive(Default)]
 struct AgentBucket {
     agent_type: Option<String>,
+    title: Option<String>,
     cost_usd: f64,
     tokens_out: i64,
     open: Vec<Value>,
     recent: Vec<Value>,
     started_at: Option<i64>,
     ended_at: Option<i64>,
+    /// `MAX(ended_at)` over this agent's closed spans in the `recent` window
+    /// — last-tool-activity signal for idle-age. May under-count for an
+    /// agent whose last close fell outside the session-wide top-10 window
+    /// (see `recent_spans_all_sessions`'s per-session, not per-agent, cap) —
+    /// an accepted approximation for a display-only idle timer.
+    last_span_end: Option<i64>,
 }
 
 /// Build the "agents" array for one session: open spans (live, from the
@@ -747,6 +754,7 @@ fn build_agents(
             if b.agent_type.is_none() {
                 b.agent_type = r.agent_type.clone();
             }
+            b.last_span_end = Some(b.last_span_end.map_or(r.ended_at, |m| m.max(r.ended_at)));
             b.recent.push(json!({
                 "span_id": r.span_id,
                 "tool_name": r.tool_name,
@@ -762,6 +770,9 @@ fn build_agents(
         }
     }
 
+    // last_ts across each agent's llm_usage rows — another idle-age signal,
+    // folded in below alongside last_span_end.
+    let mut last_llm_ts: HashMap<Option<String>, i64> = HashMap::new();
     for ((sid, agent_id), totals) in agent_totals {
         if sid != &sess.id {
             continue;
@@ -769,15 +780,19 @@ fn build_agents(
         let b = buckets.entry(agent_id.clone()).or_default();
         b.cost_usd = totals.cost_usd;
         b.tokens_out = totals.output_tokens;
+        if totals.last_ts > 0 {
+            last_llm_ts.insert(agent_id.clone(), totals.last_ts);
+        }
     }
 
-    for ((sid, agent_id), (started_at, ended_at)) in agent_span_times {
+    for ((sid, agent_id), (started_at, ended_at, title)) in agent_span_times {
         if sid != &sess.id {
             continue;
         }
         let b = buckets.entry(Some(agent_id.clone())).or_default();
         b.started_at = Some(*started_at);
         b.ended_at = *ended_at;
+        b.title = title.clone();
     }
 
     let mut keys: Vec<Option<String>> = buckets.keys().cloned().collect();
@@ -785,7 +800,15 @@ fn build_agents(
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(x), Some(y)) => x.cmp(y),
+        // "First-seen" order: agent_span.started_at when known (subagents),
+        // falling back to the id string so agents that never got a
+        // SubagentStart (span-only) still sort deterministically. Session
+        // rows are never re-sorted by this, only agents within one.
+        (Some(x), Some(y)) => {
+            let sx = buckets.get(a).and_then(|b| b.started_at);
+            let sy = buckets.get(b).and_then(|b| b.started_at);
+            sx.cmp(&sy).then_with(|| x.cmp(y))
+        }
     });
 
     keys.into_iter()
@@ -794,9 +817,26 @@ fn build_agents(
             let duration_s = b
                 .started_at
                 .map(|start| ((b.ended_at.unwrap_or(now) - start).max(0)) as f64 / 1000.0);
+            let running = !b.open.is_empty() || (b.started_at.is_some() && b.ended_at.is_none());
+            let spans = (b.open.len() + b.recent.len()) as i64;
+            let last_llm = last_llm_ts.get(&k).copied().unwrap_or(0);
+            let last_activity = [
+                b.last_span_end.unwrap_or(0),
+                last_llm,
+                b.started_at.unwrap_or(0),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            let idle_ms = if running {
+                0
+            } else {
+                (now - last_activity).max(0)
+            };
             json!({
                 "agent_id": k,
                 "agent_type": b.agent_type,
+                "title": b.title,
                 "cost_usd": (b.cost_usd * 100.0).round() / 100.0,
                 "tokens_out": b.tokens_out,
                 "open_spans": b.open,
@@ -804,6 +844,9 @@ fn build_agents(
                 "started_at": b.started_at,
                 "ended_at": b.ended_at,
                 "duration_s": duration_s,
+                "running": running,
+                "idle_ms": idle_ms,
+                "spans": spans,
             })
         })
         .collect()
@@ -848,11 +891,11 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
     let sessions: Vec<Value> = {
         let corr = st.corr.lock().unwrap();
         let mut rows: Vec<_> = corr.sessions.values().collect();
-        rows.sort_by(|a, b| {
-            b.cpu_pct
-                .partial_cmp(&a.cpu_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Stable default order: most-recently-started session first. CPU/mem/
+        // cost sort is a client-side (top.rs) toggle applied to this payload
+        // — the server never volatile-sorts, so a session's position here
+        // doesn't jump tick to tick just because its cpu% wobbled.
+        rows.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         rows.iter()
             .map(|s| {
                 let t = totals.get(&s.id);
@@ -863,6 +906,19 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                     .map(|t| (t.cost_usd * 100.0).round() / 100.0)
                     .unwrap_or(0.0);
                 let unpriced = t.map(|t| t.unpriced).unwrap_or(0);
+                let recent_for_sess = recent.get(&s.id);
+                let last_span_end = recent_for_sess
+                    .map(|v| v.iter().map(|r| r.ended_at).max().unwrap_or(0))
+                    .unwrap_or(0);
+                let last_llm_ts = t.map(|t| t.last_ts).unwrap_or(0);
+                let last_activity = last_span_end.max(last_llm_ts).max(s.started_at);
+                let running = s.current_tool.is_some();
+                let idle_ms = if running {
+                    0
+                } else {
+                    (now - last_activity).max(0)
+                };
+                let spans = s.open_spans.len() + recent_for_sess.map(|v| v.len()).unwrap_or(0);
                 json!({
                     "session_id": s.id,
                     "project": s.project_root.as_deref()
@@ -876,6 +932,9 @@ async fn api_top(State(st): State<AppState>) -> Json<Value> {
                     "procs": s.proc_count,
                     "current_tool": s.current_tool,
                     "open_spans": s.open_spans.len(),
+                    "running": running,
+                    "idle_ms": idle_ms,
+                    "spans": spans,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
                     "cache_read": cache_read,

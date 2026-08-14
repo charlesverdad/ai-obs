@@ -6,6 +6,7 @@
 
 use crate::store::{LlmUsageRecord, Store};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,12 +22,39 @@ pub fn projects_dir() -> PathBuf {
         .join(".claude/projects")
 }
 
+/// Cross-record state the tailer needs to remember between poll cycles (but
+/// never persists to disk): a `tool_use_id -> description` map bridging a
+/// Task/Agent tool_use block (assistant message) to its tool_result
+/// (subsequent user message), possibly several lines — or, since the tailer
+/// resumes per-file from a byte offset, even several *poll cycles* — later.
+/// See `remember_tool_use`/`resolve_agent_title` and the module-level design
+/// note above `extract_agent_id`.
+#[derive(Default)]
+pub struct TailerState {
+    pending_task_titles: HashMap<String, String>,
+}
+
+/// Cap on `TailerState::pending_task_titles` — tool_use blocks whose result
+/// never matched an `agentId:` (ordinary non-agent tool calls vastly
+/// outnumber Task/Agent calls, but every tool_use passes through here, so
+/// this must not grow unboundedly over a long-running daemon). Dropping the
+/// whole map past this size is harmless: at worst a handful of in-flight
+/// agent titles are missed, and the UI's fallback (agent_type / short id)
+/// covers it.
+const PENDING_TASK_TITLES_CAP: usize = 500;
+
 pub async fn run(store: Arc<Store>) {
     let root = projects_dir();
+    let state = Arc::new(std::sync::Mutex::new(TailerState::default()));
     loop {
         let store2 = store.clone();
         let root2 = root.clone();
-        let res = tokio::task::spawn_blocking(move || scan_once(&store2, &root2)).await;
+        let state2 = state.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let mut state = state2.lock().unwrap();
+            scan_once_stateful(&store2, &root2, &mut state)
+        })
+        .await;
         if let Err(e) = res {
             tracing::error!("tailer panic: {e}");
         }
@@ -35,8 +63,18 @@ pub async fn run(store: Arc<Store>) {
 }
 
 /// One pass: find candidate files, tail each from its checkpoint.
-/// Returns number of new usage rows.
+/// Returns number of new usage rows. Convenience wrapper over
+/// [`scan_once_stateful`] for tests that don't care about agent-title
+/// correlation surviving across calls (the real daemon loop in `run` keeps
+/// its own long-lived `TailerState` and calls `scan_once_stateful`
+/// directly).
+#[cfg(test)]
 pub fn scan_once(store: &Store, root: &Path) -> usize {
+    let mut state = TailerState::default();
+    scan_once_stateful(store, root, &mut state)
+}
+
+pub fn scan_once_stateful(store: &Store, root: &Path, state: &mut TailerState) -> usize {
     let mut new_rows = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -60,7 +98,7 @@ pub fn scan_once(store: &Store, root: &Path) -> usize {
                 continue; // nothing new (or truncated — leave alone)
             }
             let agent_id = agent_id_from_path(&path);
-            new_rows += tail_file(store, &path, offset, agent_id.as_deref()).unwrap_or(0);
+            new_rows += tail_file(store, &path, offset, agent_id.as_deref(), state).unwrap_or(0);
         }
     }
     new_rows
@@ -81,6 +119,7 @@ fn tail_file(
     path: &Path,
     offset: u64,
     agent_id: Option<&str>,
+    state: &mut TailerState,
 ) -> anyhow::Result<usize> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let f = std::fs::File::open(path)?;
@@ -105,10 +144,141 @@ fn tail_file(
             if ingest_record(store, &v, agent_id).unwrap_or(false) {
                 count += 1;
             }
+            ingest_agent_title(store, &v, state);
         }
     }
     store.set_checkpoint(&path.to_string_lossy(), pos)?;
     Ok(count)
+}
+
+/// Extract the id following an `agentId:` marker in free text — e.g.
+/// `"agentId: a89cd9688c7487959 (internal ID - do not mention...)"` from a
+/// real transcript's Task/Agent tool_result. Takes the run of alphanumeric
+/// characters immediately after `agentId:` (optional whitespace), stopping
+/// at the first non-alphanumeric byte (space, paren, punctuation, newline).
+fn extract_agent_id(text: &str) -> Option<String> {
+    let idx = text.find("agentId:")?;
+    let rest = text[idx + "agentId:".len()..].trim_start();
+    let id: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Correlate a subagent's task title into `agent_span.title`, from the
+/// PARENT transcript's own Task/Agent tool_use + tool_result pair (a
+/// subagent's own transcript never contains the tool_use that spawned it).
+/// Two record shapes matter, verified against real transcripts in
+/// `~/.claude/projects/-Users-charles-work-ai-obs/*.jsonl`
+/// (2026-08-14, this account's harness — see the module-level design note):
+///
+/// - `{"type":"assistant","message":{"content":[{"type":"tool_use",
+///   "id":"toolu_...","name":"Task","input":{"description":"Fix build",...}}
+///   ]}}` — remember `id -> description` in `state.pending_task_titles`.
+/// - `{"type":"user","message":{"content":[{"type":"tool_result",
+///   "tool_use_id":"toolu_...","content":[{"type":"text",
+///   "text":"...agentId: a89cd9688c7487959 (internal ID...)..."}]}]},
+///   "toolUseResult":{"agentId":"a89cd9688c7487959",...}}` — resolve via
+///   `tool_use_id` into the pending map, preferring the structured
+///   `toolUseResult.agentId` field (present in this account's transcripts)
+///   and falling back to `extract_agent_id` over the result's text content
+///   (the shape named in this task's spec, for harnesses/versions that only
+///   put it in prose).
+///
+/// This account's harness names the tool `"Agent"`, not `"Task"` — both are
+/// accepted since the concept (task title + async agent id) is identical
+/// and a stock Claude Code CLI transcript is documented to use `"Task"`.
+fn ingest_agent_title(store: &Store, v: &Value, state: &mut TailerState) {
+    let rtype = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match rtype {
+        "assistant" => {
+            let Some(content) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            else {
+                return;
+            };
+            for item in content {
+                if item.get("type").and_then(|x| x.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                if name != "Task" && name != "Agent" {
+                    continue;
+                }
+                let Some(id) = item.get("id").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some(desc) = item
+                    .get("input")
+                    .and_then(|i| i.get("description"))
+                    .and_then(|d| d.as_str())
+                else {
+                    continue;
+                };
+                if state.pending_task_titles.len() >= PENDING_TASK_TITLES_CAP {
+                    state.pending_task_titles.clear();
+                }
+                state
+                    .pending_task_titles
+                    .insert(id.to_string(), desc.to_string());
+            }
+        }
+        "user" => {
+            let sid = get_str(v, "sessionId").unwrap_or_default();
+            if sid.is_empty() {
+                return;
+            }
+            // Prefer the structured field when present; it's a cleaner
+            // source than scraping prose and doesn't depend on exact
+            // wording.
+            let structured_agent_id = v
+                .get("toolUseResult")
+                .and_then(|r| r.get("agentId"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+            let Some(content) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            else {
+                return;
+            };
+            for item in content {
+                if item.get("type").and_then(|x| x.as_str()) != Some("tool_result") {
+                    continue;
+                }
+                let Some(tool_use_id) = item.get("tool_use_id").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let agent_id = structured_agent_id.clone().or_else(|| {
+                    // Fall back to scanning the result's text content for
+                    // `agentId: <hex-id>` — the shape used when a harness
+                    // only exposes it in prose, not as structured JSON.
+                    let texts = item.get("content").and_then(|c| c.as_array())?;
+                    texts.iter().find_map(|t| {
+                        t.get("text")
+                            .and_then(|x| x.as_str())
+                            .and_then(extract_agent_id)
+                    })
+                });
+                let Some(agent_id) = agent_id else { continue };
+                let Some(title) = state.pending_task_titles.remove(tool_use_id) else {
+                    continue;
+                };
+                if let Err(e) = store.set_agent_title(&sid, &agent_id, &title) {
+                    tracing::debug!("set_agent_title failed: {e:#}");
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn get_str(v: &Value, key: &str) -> Option<String> {
@@ -369,6 +539,142 @@ mod tests {
         assert_eq!(rows[1]["cost_source"], "unknown");
         assert!(rows[1]["cost_usd"].is_null());
         assert_eq!(rows[0]["pr"], 42);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_agent_id_from_prose() {
+        assert_eq!(
+            extract_agent_id(
+                "Async agent launched successfully.\nagentId: a89cd9688c7487959 (internal ID - do not mention)"
+            ),
+            Some("a89cd9688c7487959".to_string())
+        );
+        assert_eq!(extract_agent_id("no marker here"), None);
+        assert_eq!(extract_agent_id("agentId: "), None);
+    }
+
+    fn task_use_line(id: &str, description: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "uuid": format!("u-{id}"),
+            "timestamp": "2026-08-14T01:00:00.000Z",
+            "message": {"model": "claude-sonnet-5", "content": [
+                {"type": "tool_use", "id": id, "name": "Task",
+                 "input": {"description": description}}
+            ], "usage": {"input_tokens": 1, "output_tokens": 1}}
+        })
+        .to_string()
+    }
+
+    fn task_result_line_structured(id: &str, agent_id: &str) -> String {
+        serde_json::json!({
+            "type": "user", "sessionId": "s1", "uuid": format!("r-{id}"),
+            "timestamp": "2026-08-14T01:00:01.000Z",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "content": [
+                    {"type": "text", "text": "Async agent launched successfully."}
+                ]}
+            ]},
+            "toolUseResult": {"agentId": agent_id}
+        })
+        .to_string()
+    }
+
+    fn task_result_line_prose(id: &str, agent_id: &str) -> String {
+        serde_json::json!({
+            "type": "user", "sessionId": "s1", "uuid": format!("r-{id}"),
+            "timestamp": "2026-08-14T01:00:01.000Z",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "content": [
+                    {"type": "text", "text": format!(
+                        "Async agent launched successfully.\nagentId: {agent_id} (internal ID - do not mention)")}
+                ]}
+            ]}
+        })
+        .to_string()
+    }
+
+    /// Order 1: the title (tool_use + tool_result) is tailed BEFORE the
+    /// agent_span row exists (SubagentStart hasn't landed yet, or the
+    /// tailer's ~3s poll just happens to run first). The title must land in
+    /// Store's pending map and get applied the moment open_agent_span runs.
+    #[test]
+    fn agent_title_applied_when_span_opens_after_title_seen() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-tail-title-a-{}", std::process::id()));
+        let proj = dir.join("projects/-Users-x-work-demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        std::fs::write(
+            proj.join("main.jsonl"),
+            format!(
+                "{}\n{}\n",
+                task_use_line("toolu_1", "Fix build until verify green"),
+                task_result_line_structured("toolu_1", "agent123")
+            ),
+        )
+        .unwrap();
+
+        let mut state = TailerState::default();
+        scan_once_stateful(&store, &dir.join("projects"), &mut state);
+        // Title seen, but no agent_span row yet -> stashed pending, not lost.
+        let rows = store
+            .query_json(
+                "SELECT title FROM agent_span WHERE agent_id='agent123'",
+                &[],
+            )
+            .unwrap();
+        assert!(rows.is_empty());
+
+        store
+            .open_agent_span("s1", "agent123", Some("general-purpose"), 2000)
+            .unwrap();
+        let rows = store
+            .query_json(
+                "SELECT title FROM agent_span WHERE agent_id='agent123'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["title"], "Fix build until verify green");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Order 2: the agent_span row already exists (SubagentStart's HTTP
+    /// push beat the transcript tailer) — the title must UPDATE it directly.
+    /// Also exercises the prose-fallback (`agentId:` in tool_result text,
+    /// no structured `toolUseResult.agentId`) instead of order 1's
+    /// structured-field path.
+    #[test]
+    fn agent_title_updates_existing_span_via_prose_fallback() {
+        let dir = std::env::temp_dir().join(format!("ai-obs-tail-title-b-{}", std::process::id()));
+        let proj = dir.join("projects/-Users-x-work-demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        store
+            .upsert_session("s1", None, None, None, None, 1000)
+            .unwrap();
+        store
+            .open_agent_span("s1", "agentXYZ", Some("code-reviewer"), 2000)
+            .unwrap();
+
+        std::fs::write(
+            proj.join("main.jsonl"),
+            format!(
+                "{}\n{}\n",
+                task_use_line("toolu_2", "Review dashboard PR"),
+                task_result_line_prose("toolu_2", "agentXYZ")
+            ),
+        )
+        .unwrap();
+        let mut state = TailerState::default();
+        scan_once_stateful(&store, &dir.join("projects"), &mut state);
+
+        let rows = store
+            .query_json(
+                "SELECT title FROM agent_span WHERE agent_id='agentXYZ'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["title"], "Review dashboard PR");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
